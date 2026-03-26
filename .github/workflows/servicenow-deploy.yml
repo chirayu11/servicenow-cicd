@@ -1,0 +1,517 @@
+# =============================================================================
+# ServiceNow — Promote Dev to Test
+#
+# Automatically discovers all completed Update Sets in PDI1 (dev) that have
+# not yet been committed to PDI2 (test), presents the list for human review,
+# then exports, imports, previews, and commits each set in order.
+#
+# FUTURE EXTENSIONS (see roadmap in README):
+#   Phase 2 — Bravium code linting: add a 'lint' job between discover and
+#              await-approval; run Bravium CLI against exported XML artifacts
+#   Phase 2 — Human approval: already implemented via 'deploy-test' environment
+#   Phase 3 — Playwright / SauceLabs: add a 'verify' job after 'deploy' that
+#              triggers your Playwright suite against PDI2 in SauceLabs
+#   Phase 4 — Changelog: add a 'changelog' step in 'summary' to generate
+#              CHANGELOG entries and create a GitHub Release with set names + label
+#   Phase 4 — ServiceNow Change Request: add steps in 'deploy' to create a
+#              sys_change_request before the first set and close it after the last
+# =============================================================================
+
+name: ServiceNow — Promote Dev to Test
+
+run-name: "${{ inputs.deployment_label }} (by ${{ github.actor }})"
+
+on:
+  workflow_dispatch:
+    inputs:
+      deployment_label:
+        description: 'Deployment label — describe what this release contains'
+        required: false
+        type: string
+        default: "Promote dev to test"
+      dry_run:
+        description: "Dry run — show what would be deployed, skip approval and deploy"
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # JOB 1: Discover
+  # Queries both instances and computes the delta — complete sets in PDI1 that
+  # have not yet been committed on PDI2. Writes a review table to Step Summary.
+  # The reviewer reads this table before clicking Approve in Job 2.
+  # ---------------------------------------------------------------------------
+  discover:
+    name: Discover Update Sets
+    runs-on: ubuntu-latest
+    outputs:
+      sets_json: ${{ steps.diff.outputs.sets_json }}
+      set_count: ${{ steps.diff.outputs.set_count }}
+
+    steps:
+      - name: Query PDI1 — complete update sets (oldest first)
+        env:
+          SN_USER: ${{ secrets.SN_PDI1_USERNAME }}
+          SN_PASS: ${{ secrets.SN_PDI1_PASSWORD }}
+        run: |
+          # Fetch all complete update sets ordered by creation date.
+          # Oldest-first ordering is intentional: it preserves the natural
+          # dependency chain (e.g., a table-creation set deploys before a
+          # field-addition set that depends on it).
+          RESPONSE=$(curl --silent --fail \
+            --user "${SN_USER}:${SN_PASS}" \
+            --header "Accept: application/json" \
+            "https://${{ secrets.SN_PDI1_INSTANCE }}.service-now.com/api/now/table/sys_update_set?sysparm_query=state%3Dcomplete&sysparm_orderby=sys_created_on&sysparm_fields=sys_id,name,description,state,sys_created_on&sysparm_limit=500")
+
+          echo "$RESPONSE" > /tmp/pdi1_sets.json
+
+          COUNT=$(echo "$RESPONSE" | python3 -c \
+            "import sys,json; print(len(json.load(sys.stdin).get('result',[])))")
+          echo "Found $COUNT complete update set(s) on PDI1"
+
+      - name: Query PDI2 — already-committed remote update sets
+        env:
+          SN_USER: ${{ secrets.SN_PDI2_USERNAME }}
+          SN_PASS: ${{ secrets.SN_PDI2_PASSWORD }}
+        run: |
+          RESPONSE=$(curl --silent --fail \
+            --user "${SN_USER}:${SN_PASS}" \
+            --header "Accept: application/json" \
+            "https://${{ secrets.SN_PDI2_INSTANCE }}.service-now.com/api/now/table/sys_remote_update_set?sysparm_query=state%3Dcommitted&sysparm_fields=name,state&sysparm_limit=500")
+
+          echo "$RESPONSE" > /tmp/pdi2_committed.json
+
+          COUNT=$(echo "$RESPONSE" | python3 -c \
+            "import sys,json; print(len(json.load(sys.stdin).get('result',[])))")
+          echo "Found $COUNT already-committed update set(s) on PDI2"
+
+      - name: Check PDI2 for update sets stuck in partial state
+        env:
+          SN_USER: ${{ secrets.SN_PDI2_USERNAME }}
+          SN_PASS: ${{ secrets.SN_PDI2_PASSWORD }}
+        run: |
+          # Loaded/previewed sets on PDI2 mean a previous pipeline run
+          # partially completed. Flag them so the developer knows to
+          # resolve them manually before this run proceeds.
+          RESPONSE=$(curl --silent --fail \
+            --user "${SN_USER}:${SN_PASS}" \
+            --header "Accept: application/json" \
+            "https://${{ secrets.SN_PDI2_INSTANCE }}.service-now.com/api/now/table/sys_remote_update_set?sysparm_query=stateIN%28loaded%2Cpreviewed%29&sysparm_fields=name,state&sysparm_limit=50")
+
+          echo "$RESPONSE" > /tmp/pdi2_partial.json
+
+          COUNT=$(echo "$RESPONSE" | python3 -c \
+            "import sys,json; print(len(json.load(sys.stdin).get('result',[])))")
+
+          if [ "$COUNT" -gt 0 ]; then
+            echo "::warning::Found $COUNT update set(s) on PDI2 in a partial state (loaded/previewed). These need manual resolution in PDI2 before this deployment can safely proceed."
+            echo "$RESPONSE" | python3 -c "
+          import sys,json
+          for r in json.load(sys.stdin).get('result',[]):
+              print(f\"  - '{r['name']}' (state: {r['state']})\")
+          "
+          fi
+
+      - name: Compute diff and write review table
+        id: diff
+        run: |
+          python3 << 'PYEOF'
+          import json, os
+
+          with open('/tmp/pdi1_sets.json') as f:
+              pdi1_data = json.load(f)
+          with open('/tmp/pdi2_committed.json') as f:
+              pdi2_data = json.load(f)
+          with open('/tmp/pdi2_partial.json') as f:
+              pdi2_partial_data = json.load(f)
+
+          pdi1_sets = pdi1_data.get('result', [])
+          pdi2_committed = {r['name'].strip().lower() for r in pdi2_data.get('result', [])}
+          pdi2_partial   = {r['name'].strip().lower(): r['state']
+                            for r in pdi2_partial_data.get('result', [])}
+
+          to_deploy = []
+          skipped_committed = []
+          flagged_partial = []
+
+          for s in pdi1_sets:
+              name = s['name'].strip()
+              name_lower = name.lower()
+              if name_lower in pdi2_committed:
+                  skipped_committed.append(name)
+              elif name_lower in pdi2_partial:
+                  flagged_partial.append((name, pdi2_partial[name_lower]))
+              else:
+                  to_deploy.append({
+                      'name': name,
+                      'sys_id': s['sys_id'],
+                      'created': s.get('sys_created_on', '')[:10],
+                      'description': (s.get('description') or '').strip()
+                  })
+
+          # ---- Write Step Summary ----
+          lines = ['## Discover Results\n']
+
+          if to_deploy:
+              lines.append(f'**{len(to_deploy)} update set(s) ready to promote PDI1 → PDI2:**\n')
+              lines.append('| # | Update Set | Created | Description |')
+              lines.append('|---|---|---|---|')
+              for i, s in enumerate(to_deploy, 1):
+                  desc = s['description']
+                  if len(desc) > 70:
+                      desc = desc[:70] + '…'
+                  lines.append(f"| {i} | `{s['name']}` | {s['created']} | {desc or '—'} |")
+          else:
+              lines.append('**Nothing to deploy — PDI2 is already up to date.**\n')
+
+          if flagged_partial:
+              lines.append('\n> **Warning:** The following sets exist on PDI2 in a partial state and need manual attention before deploying:')
+              for name, state in flagged_partial:
+                  lines.append(f'> - `{name}` (state: {state})')
+
+          if skipped_committed:
+              lines.append('\n<details>')
+              lines.append('<summary>Already committed on PDI2 (skipped)</summary>\n')
+              for name in skipped_committed:
+                  lines.append(f'- `{name}`')
+              lines.append('\n</details>')
+
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write('\n'.join(lines) + '\n')
+
+          # ---- Write job outputs ----
+          sets_json = json.dumps(to_deploy)
+          set_count = len(to_deploy)
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              # Multiline value syntax to safely handle JSON with special chars
+              f.write(f'sets_json<<__EOF__\n{sets_json}\n__EOF__\n')
+              f.write(f'set_count={set_count}\n')
+
+          print(f'Sets to deploy: {set_count}')
+          PYEOF
+
+      - name: Nothing to deploy — exit early
+        if: steps.diff.outputs.set_count == '0'
+        run: |
+          echo "::notice::PDI2 is already up to date. No update sets to promote."
+
+  # ---------------------------------------------------------------------------
+  # JOB 2: Await Approval
+  # Uses a GitHub Environment with required reviewers to pause the workflow.
+  # The reviewer sees the Job 1 Step Summary table (the deployment list) in the
+  # Actions UI and clicks Approve or Deny.
+  #
+  # Setup: Go to Settings → Environments → New environment → Name: deploy-test
+  #        Add required reviewers. Set a timeout if desired.
+  #
+  # On Approve → deploy job runs.
+  # On Deny / timeout → workflow is cancelled; both instances unchanged.
+  # ---------------------------------------------------------------------------
+  await-approval:
+    name: Await Deployment Approval
+    needs: discover
+    # Skip if nothing to deploy or this is a dry run (discover only)
+    if: |
+      needs.discover.outputs.set_count != '0' &&
+      inputs.dry_run != true
+    runs-on: ubuntu-latest
+    environment: deploy-test
+
+    steps:
+      - name: Deployment approved
+        run: |
+          echo "Approved by: ${{ github.actor }}"
+          echo "Label: ${{ inputs.deployment_label }}"
+          echo "Update sets to deploy: ${{ needs.discover.outputs.set_count }}"
+
+  # ---------------------------------------------------------------------------
+  # JOB 3: Deploy
+  # Processes each update set sequentially (max-parallel: 1) in creation-date
+  # order. Each set goes through: export → import → preview → commit.
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: "Deploy: ${{ matrix.update_set.name }}"
+    needs: [discover, await-approval]
+    # Only runs after a successful explicit approval
+    if: needs.await-approval.result == 'success'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        update_set: ${{ fromJson(needs.discover.outputs.sets_json) }}
+      max-parallel: 1   # Sequential: preserves dependency ordering
+      fail-fast: true   # Stop remaining sets if one fails
+
+    steps:
+
+      # -----------------------------------------------------------------------
+      # Step 1: Export
+      # Downloads the update set as XML from PDI1.
+      # Validates the response is real XML (ServiceNow sometimes returns an HTML
+      # error page with HTTP 200 when the session is invalid or PDI is sleeping).
+      # -----------------------------------------------------------------------
+      - name: "1/5 — Export XML from PDI1"
+        id: export
+        env:
+          SN_USER: ${{ secrets.SN_PDI1_USERNAME }}
+          SN_PASS: ${{ secrets.SN_PDI1_PASSWORD }}
+          SYS_ID: ${{ matrix.update_set.sys_id }}
+          SET_NAME: ${{ matrix.update_set.name }}
+        run: |
+          echo "Exporting: '${SET_NAME}' (sys_id: ${SYS_ID})"
+          EXPORT_FILE="/tmp/update_set_${SYS_ID}.xml"
+
+          HTTP_STATUS=$(curl --silent \
+            --user "${SN_USER}:${SN_PASS}" \
+            --header "Accept: application/xml" \
+            --output "$EXPORT_FILE" \
+            --write-out "%{http_code}" \
+            "https://${{ secrets.SN_PDI1_INSTANCE }}.service-now.com/sys_update_set_export_xml.do?sysparm_sys_id=${SYS_ID}")
+
+          if [ "$HTTP_STATUS" -ne 200 ]; then
+            echo "::error::Export from PDI1 failed with HTTP ${HTTP_STATUS}. Check secrets and whether the PDI1 instance is awake."
+            exit 1
+          fi
+
+          # Guard against HTML error pages served with HTTP 200
+          if ! python3 -c "
+          import xml.etree.ElementTree as ET, sys
+          try:
+              ET.parse('$EXPORT_FILE')
+          except ET.ParseError as e:
+              print(f'XML parse error: {e}', file=sys.stderr)
+              sys.exit(1)
+          " 2>&1; then
+            echo "::error::Response is not valid XML. Log in to PDI1 in a browser to wake the instance, then retry."
+            head -3 "$EXPORT_FILE"
+            exit 1
+          fi
+
+          FILE_BYTES=$(wc -c < "$EXPORT_FILE")
+          echo "export_file=$EXPORT_FILE" >> "$GITHUB_OUTPUT"
+          echo "Exported ${FILE_BYTES} bytes of XML"
+
+      # -----------------------------------------------------------------------
+      # Step 2: Import
+      # Uploads the XML to PDI2 via the update set upload form endpoint.
+      # Then locates the created sys_remote_update_set record by name.
+      # The 3-second sleep is intentional: the upload endpoint returns before
+      # the server-side script finishes writing the sys_remote_update_set record.
+      # -----------------------------------------------------------------------
+      - name: "2/5 — Import XML to PDI2"
+        id: import
+        env:
+          SN_USER: ${{ secrets.SN_PDI2_USERNAME }}
+          SN_PASS: ${{ secrets.SN_PDI2_PASSWORD }}
+          EXPORT_FILE: ${{ steps.export.outputs.export_file }}
+          SET_NAME: ${{ matrix.update_set.name }}
+        run: |
+          HTTP_STATUS=$(curl --silent \
+            --user "${SN_USER}:${SN_PASS}" \
+            --request POST \
+            --form "file=@${EXPORT_FILE};type=application/xml" \
+            --output /tmp/import_response.txt \
+            --write-out "%{http_code}" \
+            --location \
+            "https://${{ secrets.SN_PDI2_INSTANCE }}.service-now.com/sys_update_set_upload.do")
+
+          echo "Import HTTP status: ${HTTP_STATUS}"
+
+          # Allow the server-side processor to write the remote update set record
+          sleep 3
+
+          ENCODED=$(python3 -c \
+            "import urllib.parse, sys; print(urllib.parse.quote(sys.stdin.read().strip()))" \
+            <<< "$SET_NAME")
+
+          RESPONSE=$(curl --silent --fail \
+            --user "${SN_USER}:${SN_PASS}" \
+            --header "Accept: application/json" \
+            "https://${{ secrets.SN_PDI2_INSTANCE }}.service-now.com/api/now/table/sys_remote_update_set?sysparm_query=name%3D${ENCODED}%5EstateLOADloaded&sysparm_fields=sys_id,name,state&sysparm_orderby=sys_created_on&sysparm_limit=1")
+
+          REMOTE_SYS_ID=$(echo "$RESPONSE" | python3 -c "
+          import sys, json
+          results = json.load(sys.stdin).get('result', [])
+          print(results[-1]['sys_id'] if results else '')
+          ")
+
+          if [ -z "$REMOTE_SYS_ID" ]; then
+            echo "::error::Could not locate the imported sys_remote_update_set record for '${SET_NAME}' on PDI2."
+            echo "This may mean the upload failed silently or the name does not match."
+            exit 1
+          fi
+
+          echo "remote_sys_id=${REMOTE_SYS_ID}" >> "$GITHUB_OUTPUT"
+          echo "Found remote update set on PDI2: ${REMOTE_SYS_ID}"
+
+      # -----------------------------------------------------------------------
+      # Step 3: Trigger Preview
+      # Calls the ServiceNow preview processor to start collision detection.
+      # Preview runs asynchronously — Step 4 polls until it finishes.
+      # -----------------------------------------------------------------------
+      - name: "3/5 — Trigger Preview on PDI2"
+        id: preview_trigger
+        env:
+          SN_USER: ${{ secrets.SN_PDI2_USERNAME }}
+          SN_PASS: ${{ secrets.SN_PDI2_PASSWORD }}
+          REMOTE_SYS_ID: ${{ steps.import.outputs.remote_sys_id }}
+        run: |
+          # The preview processor is a legacy .do endpoint — the same one the
+          # ServiceNow UI calls when you click the "Preview" button.
+          curl --silent \
+            --user "${SN_USER}:${SN_PASS}" \
+            --output /tmp/preview_trigger.txt \
+            "https://${{ secrets.SN_PDI2_INSTANCE }}.service-now.com/sys_remote_update_set_preview.do?sysparm_sys_id=${REMOTE_SYS_ID}"
+
+          echo "Preview triggered for ${REMOTE_SYS_ID}"
+
+      # -----------------------------------------------------------------------
+      # Step 4: Poll Until Preview Completes
+      # Polls the sys_remote_update_set record every 10 seconds.
+      # On completion, checks sys_update_preview_problem for collisions.
+      # Fails the job if any collision-type problems are found.
+      # -----------------------------------------------------------------------
+      - name: "4/5 — Poll Until Preview Completes"
+        id: preview_poll
+        env:
+          SN_USER: ${{ secrets.SN_PDI2_USERNAME }}
+          SN_PASS: ${{ secrets.SN_PDI2_PASSWORD }}
+          REMOTE_SYS_ID: ${{ steps.import.outputs.remote_sys_id }}
+          SET_NAME: ${{ matrix.update_set.name }}
+        run: |
+          TIMEOUT=300
+          INTERVAL=10
+          ELAPSED=0
+
+          echo "Polling preview state (max ${TIMEOUT}s, every ${INTERVAL}s)..."
+
+          while true; do
+            RESPONSE=$(curl --silent --fail \
+              --user "${SN_USER}:${SN_PASS}" \
+              --header "Accept: application/json" \
+              "https://${{ secrets.SN_PDI2_INSTANCE }}.service-now.com/api/now/table/sys_remote_update_set/${REMOTE_SYS_ID}?sysparm_fields=sys_id,name,state")
+
+            STATE=$(echo "$RESPONSE" | python3 -c \
+              "import sys,json; print(json.load(sys.stdin)['result']['state'])")
+
+            echo "[${ELAPSED}s] Preview state: ${STATE}"
+
+            if [ "$STATE" = "previewed" ]; then
+              echo "Preview completed."
+              break
+            elif [ "$STATE" = "error" ]; then
+              echo "::error::Preview ended in error state. Open PDI2 → Retrieved Update Sets → '${SET_NAME}' to investigate."
+              exit 1
+            fi
+
+            if [ "$ELAPSED" -ge "$TIMEOUT" ]; then
+              echo "::error::Preview timed out after ${TIMEOUT}s. Last state: ${STATE}"
+              exit 1
+            fi
+
+            sleep "$INTERVAL"
+            ELAPSED=$((ELAPSED + INTERVAL))
+          done
+
+          # Check for collision-type preview problems
+          PROBLEMS=$(curl --silent --fail \
+            --user "${SN_USER}:${SN_PASS}" \
+            --header "Accept: application/json" \
+            "https://${{ secrets.SN_PDI2_INSTANCE }}.service-now.com/api/now/table/sys_update_preview_problem?sysparm_query=remote_update_set%3D${REMOTE_SYS_ID}%5Etype%3Dconflict&sysparm_fields=sys_id,type,description&sysparm_limit=50")
+
+          COLLISION_COUNT=$(echo "$PROBLEMS" | python3 -c \
+            "import sys,json; print(len(json.load(sys.stdin).get('result',[])))")
+
+          if [ "$COLLISION_COUNT" -gt 0 ]; then
+            echo "::error::Preview completed but found ${COLLISION_COUNT} collision(s) for '${SET_NAME}'. Resolve these manually in PDI2 before retrying."
+            echo "$PROBLEMS" | python3 -c "
+          import sys, json
+          for r in json.load(sys.stdin).get('result', []):
+              print(f\"  COLLISION: {r.get('description', '(no description)')}\")"
+            exit 1
+          fi
+
+          echo "No collisions detected. Safe to commit."
+
+      # -----------------------------------------------------------------------
+      # Step 5: Commit
+      # Calls the ServiceNow commit processor. Commit is asynchronous on large
+      # update sets, so we wait 5 seconds then verify the final state.
+      # -----------------------------------------------------------------------
+      - name: "5/5 — Commit on PDI2"
+        id: commit
+        env:
+          SN_USER: ${{ secrets.SN_PDI2_USERNAME }}
+          SN_PASS: ${{ secrets.SN_PDI2_PASSWORD }}
+          REMOTE_SYS_ID: ${{ steps.import.outputs.remote_sys_id }}
+          SET_NAME: ${{ matrix.update_set.name }}
+        run: |
+          curl --silent \
+            --user "${SN_USER}:${SN_PASS}" \
+            --request POST \
+            --output /tmp/commit_response.txt \
+            "https://${{ secrets.SN_PDI2_INSTANCE }}.service-now.com/sys_remote_update_set_commit.do?sysparm_sys_id=${REMOTE_SYS_ID}&sysparm_ck="
+
+          # Allow async commit processing to finish
+          sleep 5
+
+          RESPONSE=$(curl --silent --fail \
+            --user "${SN_USER}:${SN_PASS}" \
+            --header "Accept: application/json" \
+            "https://${{ secrets.SN_PDI2_INSTANCE }}.service-now.com/api/now/table/sys_remote_update_set/${REMOTE_SYS_ID}?sysparm_fields=state,name")
+
+          FINAL_STATE=$(echo "$RESPONSE" | python3 -c \
+            "import sys,json; print(json.load(sys.stdin)['result']['state'])")
+
+          echo "Final state: ${FINAL_STATE}"
+
+          if [ "$FINAL_STATE" = "committed" ]; then
+            echo "::notice::Successfully committed '${SET_NAME}' to PDI2."
+            echo "### Committed: \`${SET_NAME}\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Remote sys_id on PDI2: \`${REMOTE_SYS_ID}\`" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::error::Commit may not have completed. Final state: '${FINAL_STATE}' (expected 'committed'). Check PDI2 → Retrieved Update Sets."
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------
+  # JOB 4: Summary
+  # Always runs. Writes a final report to the GitHub Step Summary.
+  # ---------------------------------------------------------------------------
+  summary:
+    name: Deployment Summary
+    needs: [discover, await-approval, deploy]
+    if: always()
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Write final report
+        run: |
+          {
+            echo "## Deployment Summary"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Triggered by | \`${{ github.actor }}\` |"
+            echo "| Label | ${{ inputs.deployment_label }} |"
+            echo "| Dry Run | ${{ inputs.dry_run }} |"
+            echo "| Update Sets Found | ${{ needs.discover.outputs.set_count }} |"
+            echo "| Discover | ${{ needs.discover.result }} |"
+            echo "| Approval | ${{ needs.await-approval.result }} |"
+            echo "| Deploy | ${{ needs.deploy.result }} |"
+            echo ""
+
+            if [ "${{ needs.deploy.result }}" = "success" ]; then
+              echo "**All update sets successfully committed to PDI2.**"
+            elif [ "${{ inputs.dry_run }}" = "true" ]; then
+              echo "**Dry run — discovery complete. No changes were made.**"
+            elif [ "${{ needs.await-approval.result }}" = "failure" ]; then
+              echo "**Deployment rejected or timed out at approval gate. No changes were made.**"
+            elif [ "${{ needs.discover.outputs.set_count }}" = "0" ]; then
+              echo "**Nothing to deploy — PDI2 is already up to date.**"
+            else
+              echo "**Deployment failed — review the deploy job logs above.**"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
