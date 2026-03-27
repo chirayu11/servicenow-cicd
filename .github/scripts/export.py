@@ -25,7 +25,26 @@ EXPORT_FILE = f'/tmp/update_set_{SYS_ID}.xml'
 
 print(f"Exporting: '{SET_NAME}' (sys_id: {SYS_ID})")
 
-client  = ServiceNowClient.from_env()
+client = ServiceNowClient.from_env()
+
+# Verify the update set exists and is complete.
+# This Table API call also primes the requests.Session cookie so the
+# subsequent legacy .do export endpoint receives a valid server-side session
+# (the .do processor requires session-based auth; Basic Auth alone is not enough).
+us = client.get_json(
+    f'/api/now/table/sys_update_set/{SYS_ID}'
+    f'?sysparm_fields=sys_id,name,state'
+).get('result', {})
+
+if not us:
+    print(f'::error::Update set {SYS_ID} not found on dev.')
+    sys.exit(1)
+if us.get('state') != 'complete':
+    print(
+        f"::warning::Update set state is '{us.get('state')}', expected 'complete'. "
+        'Proceeding anyway.'
+    )
+
 content = client.get_raw(
     f'/sys_update_set_export_xml.do?sysparm_sys_id={SYS_ID}'
 )

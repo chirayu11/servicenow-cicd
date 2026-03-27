@@ -1,0 +1,663 @@
+{
+  "info": {
+    "_postman_id": "a1b2c3d4-0001-4c3d-8e9f-000000000001",
+    "name": "ServiceNow CI/CD Pipeline",
+    "description": "Manual test suite mirroring every API call made by the GitHub Actions CI/CD pipeline.\n\n**Before you start:**\n1. Open the collection, go to Variables, and fill in all six credential variables.\n2. Set `SET_NAME` to the exact name of the update set you want to test.\n3. Run requests top-to-bottom — post-response scripts auto-populate `SYS_ID`, `REMOTE_SYS_ID`, etc. as you go.\n\nThe workflow order mirrors the pipeline: Discover → Precheck → Export → Import → Preview → Commit.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "noauth"
+  },
+  "variable": [
+    {
+      "key": "SN_DEV_INSTANCE",
+      "value": "",
+      "type": "string",
+      "description": "Dev instance subdomain only, e.g. mycompany-dev (not the full URL)"
+    },
+    {
+      "key": "SN_DEV_USER",
+      "value": "",
+      "type": "string",
+      "description": "Dev admin username"
+    },
+    {
+      "key": "SN_DEV_PASS",
+      "value": "",
+      "type": "string",
+      "description": "Dev admin password"
+    },
+    {
+      "key": "SN_TEST_INSTANCE",
+      "value": "",
+      "type": "string",
+      "description": "Test instance subdomain only, e.g. mycompany-test"
+    },
+    {
+      "key": "SN_TEST_USER",
+      "value": "",
+      "type": "string",
+      "description": "Test admin username"
+    },
+    {
+      "key": "SN_TEST_PASS",
+      "value": "",
+      "type": "string",
+      "description": "Test admin password"
+    },
+    {
+      "key": "SET_NAME",
+      "value": "Demo Navigation Item",
+      "type": "string",
+      "description": "Exact update set name. Auto-populated from the first result of '1 · Discover > [Dev] List complete update sets'."
+    },
+    {
+      "key": "SYS_ID",
+      "value": "",
+      "type": "string",
+      "description": "sys_id of the local update set on dev. Auto-populated from '1 · Discover > [Dev] List complete update sets'."
+    },
+    {
+      "key": "REMOTE_SYS_ID",
+      "value": "",
+      "type": "string",
+      "description": "sys_id of the remote update set record on test. Auto-populated from '2 · Precheck' or '4 · Import > Verify import'."
+    }
+  ],
+  "item": [
+    {
+      "name": "1 · Discover",
+      "description": "Mirrors discover.py — queries both instances to build the deployment list.\n\nRun all three requests to replicate what the Discover job does. The first request auto-populates SYS_ID and SET_NAME for the oldest complete update set on dev.",
+      "item": [
+        {
+          "name": "[Dev] List complete update sets",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "    var json = pm.response.json();",
+                  "    if (json.result && json.result.length > 0) {",
+                  "        var first = json.result[0];",
+                  "        pm.collectionVariables.set('SYS_ID', first.sys_id);",
+                  "        pm.collectionVariables.set('SET_NAME', first.name);",
+                  "        console.log('[Auto] SYS_ID  → ' + first.sys_id);",
+                  "        console.log('[Auto] SET_NAME → ' + first.name);",
+                  "        pm.test('At least one complete update set found', function () {",
+                  "            pm.expect(json.result.length).to.be.above(0);",
+                  "        });",
+                  "    } else {",
+                  "        console.warn('No complete update sets found on dev.');",
+                  "    }",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "basic",
+              "basic": [
+                { "key": "username", "value": "{{SN_DEV_USER}}", "type": "string" },
+                { "key": "password", "value": "{{SN_DEV_PASS}}", "type": "string" }
+              ]
+            },
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "https://{{SN_DEV_INSTANCE}}.service-now.com/api/now/table/sys_update_set?sysparm_query=state=complete&sysparm_orderby=sys_created_on&sysparm_fields=sys_id,name,description,state,sys_created_on&sysparm_limit=500",
+              "protocol": "https",
+              "host": ["{{SN_DEV_INSTANCE}}", "service-now", "com"],
+              "path": ["api", "now", "table", "sys_update_set"],
+              "query": [
+                { "key": "sysparm_query", "value": "state=complete", "description": "Filter to complete update sets only" },
+                { "key": "sysparm_orderby", "value": "sys_created_on", "description": "Oldest first — preserves dependency order" },
+                { "key": "sysparm_fields", "value": "sys_id,name,description,state,sys_created_on" },
+                { "key": "sysparm_limit", "value": "500" }
+              ]
+            },
+            "description": "Fetches all complete local update sets from dev, oldest-first.\n\n**Script:** `discover.py` (Query 1)\n\n**Post-response:** automatically sets `SYS_ID` and `SET_NAME` collection variables from the first (oldest) result."
+          },
+          "response": []
+        },
+        {
+          "name": "[Test] List committed remote update sets",
+          "request": {
+            "auth": {
+              "type": "basic",
+              "basic": [
+                { "key": "username", "value": "{{SN_TEST_USER}}", "type": "string" },
+                { "key": "password", "value": "{{SN_TEST_PASS}}", "type": "string" }
+              ]
+            },
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "https://{{SN_TEST_INSTANCE}}.service-now.com/api/now/table/sys_remote_update_set?sysparm_query=state=committed&sysparm_fields=name,state&sysparm_limit=500",
+              "protocol": "https",
+              "host": ["{{SN_TEST_INSTANCE}}", "service-now", "com"],
+              "path": ["api", "now", "table", "sys_remote_update_set"],
+              "query": [
+                { "key": "sysparm_query", "value": "state=committed" },
+                { "key": "sysparm_fields", "value": "name,state" },
+                { "key": "sysparm_limit", "value": "500" }
+              ]
+            },
+            "description": "Lists all already-committed remote update sets on test.\n\n**Script:** `discover.py` (Query 2)\n\nUsed to determine which dev sets are already deployed and can be skipped. If any names appear here that do NOT exist in the dev complete list, the pipeline will fail with a 'test is ahead of dev' error."
+          },
+          "response": []
+        },
+        {
+          "name": "[Test] List loaded and previewed remote update sets",
+          "request": {
+            "auth": {
+              "type": "basic",
+              "basic": [
+                { "key": "username", "value": "{{SN_TEST_USER}}", "type": "string" },
+                { "key": "password", "value": "{{SN_TEST_PASS}}", "type": "string" }
+              ]
+            },
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "https://{{SN_TEST_INSTANCE}}.service-now.com/api/now/table/sys_remote_update_set?sysparm_query=stateIN(loaded,previewed)&sysparm_fields=sys_id,name,state&sysparm_limit=50",
+              "protocol": "https",
+              "host": ["{{SN_TEST_INSTANCE}}", "service-now", "com"],
+              "path": ["api", "now", "table", "sys_remote_update_set"],
+              "query": [
+                { "key": "sysparm_query", "value": "stateIN(loaded,previewed)", "description": "Partial-state sets — pipeline will resume these from the appropriate step" },
+                { "key": "sysparm_fields", "value": "sys_id,name,state" },
+                { "key": "sysparm_limit", "value": "50" }
+              ]
+            },
+            "description": "Lists remote update sets on test that are partially deployed (imported but not yet committed).\n\n**Script:** `discover.py` (Query 3)\n\nSets in `loaded` state will resume from the Preview step. Sets in `previewed` state will resume from the Commit step."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "2 · Precheck",
+      "description": "Mirrors precheck.py — queries test live for the current state of a specific update set.\n\nRun this before each deploy to confirm whether the set needs a full deploy, a partial resume, or can be skipped entirely. The post-response script sets REMOTE_SYS_ID if a record is found.",
+      "item": [
+        {
+          "name": "[Test] Get remote update set by name",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "    var json = pm.response.json();",
+                  "    if (json.result && json.result.length > 0) {",
+                  "        var latest = json.result[json.result.length - 1];",
+                  "        pm.collectionVariables.set('REMOTE_SYS_ID', latest.sys_id);",
+                  "        console.log('[Auto] REMOTE_SYS_ID → ' + latest.sys_id + '  (state: ' + latest.state + ')');",
+                  "        var stateMap = {",
+                  "            'committed':  'action = skip (already deployed)',",
+                  "            'previewed':  'action = resume_previewed (go straight to commit)',",
+                  "            'loaded':     'action = resume_loaded (start from preview)',",
+                  "        };",
+                  "        var action = stateMap[latest.state] || 'action = deploy (full deploy needed)';",
+                  "        console.log('[Precheck] ' + action);",
+                  "        pm.test('Precheck state is recognised', function () {",
+                  "            pm.expect(['committed','previewed','loaded']).to.include(latest.state);",
+                  "        });",
+                  "    } else {",
+                  "        console.log('[Precheck] Set not found on test → action = deploy (full deploy needed)');",
+                  "    }",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "basic",
+              "basic": [
+                { "key": "username", "value": "{{SN_TEST_USER}}", "type": "string" },
+                { "key": "password", "value": "{{SN_TEST_PASS}}", "type": "string" }
+              ]
+            },
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "https://{{SN_TEST_INSTANCE}}.service-now.com/api/now/table/sys_remote_update_set?sysparm_query=name={{SET_NAME}}&sysparm_fields=sys_id,name,state&sysparm_orderby=sys_created_on&sysparm_limit=10",
+              "protocol": "https",
+              "host": ["{{SN_TEST_INSTANCE}}", "service-now", "com"],
+              "path": ["api", "now", "table", "sys_remote_update_set"],
+              "query": [
+                { "key": "sysparm_query", "value": "name={{SET_NAME}}", "description": "Exact name match — ServiceNow encodes this as name%3D{{SET_NAME}}" },
+                { "key": "sysparm_fields", "value": "sys_id,name,state" },
+                { "key": "sysparm_orderby", "value": "sys_created_on", "description": "Oldest first; script uses the last element as the most recent" },
+                { "key": "sysparm_limit", "value": "10" }
+              ]
+            },
+            "description": "Queries test for the current deployment state of the update set named `{{SET_NAME}}`.\n\n**Script:** `precheck.py`\n\n**Post-response:** sets `REMOTE_SYS_ID` from the most-recently-created matching record, and logs the resulting pipeline action."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "3 · Export",
+      "description": "Mirrors export.py — verifies the update set on dev and downloads it as XML.\n\nRun the Verify request first. It confirms the set exists and is in 'complete' state. Because the pipeline uses requests.Session, the Verify call also establishes the server-side session cookie required by the legacy Export endpoint.",
+      "item": [
+        {
+          "name": "[Dev] Verify update set exists and state",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "    var json = pm.response.json();",
+                  "    var result = json.result;",
+                  "    if (!result || !result.sys_id) {",
+                  "        console.error('[Error] Update set ' + pm.collectionVariables.get('SYS_ID') + ' not found on dev.');",
+                  "        pm.test('Update set found on dev', function () { pm.expect(result).to.exist; });",
+                  "        return;",
+                  "    }",
+                  "    pm.test('Update set found on dev', function () { pm.expect(result.sys_id).to.be.a('string'); });",
+                  "    pm.test('Update set state is complete', function () {",
+                  "        if (result.state !== 'complete') {",
+                  "            console.warn('[Warning] State is \"' + result.state + '\", expected \"complete\". Export may fail.');",
+                  "        }",
+                  "        pm.expect(result.state).to.equal('complete');",
+                  "    });",
+                  "    console.log('[Verify] ' + result.name + '  state=' + result.state + '  sys_id=' + result.sys_id);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "basic",
+              "basic": [
+                { "key": "username", "value": "{{SN_DEV_USER}}", "type": "string" },
+                { "key": "password", "value": "{{SN_DEV_PASS}}", "type": "string" }
+              ]
+            },
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "https://{{SN_DEV_INSTANCE}}.service-now.com/api/now/table/sys_update_set/{{SYS_ID}}?sysparm_fields=sys_id,name,state",
+              "protocol": "https",
+              "host": ["{{SN_DEV_INSTANCE}}", "service-now", "com"],
+              "path": ["api", "now", "table", "sys_update_set", "{{SYS_ID}}"],
+              "query": [
+                { "key": "sysparm_fields", "value": "sys_id,name,state" }
+              ]
+            },
+            "description": "Fetches the update set record by sys_id to confirm it exists and is in `complete` state before attempting the XML export.\n\n**Script:** `export.py` (verify step, added to fix session priming)\n\n**Why this matters:** The export `.do` endpoint requires a server-side session cookie. In the pipeline, `requests.Session` carries this cookie from this Table API call into the next `.do` call automatically. In Postman, run this request **in the same session** before the Export XML request."
+          },
+          "response": []
+        },
+        {
+          "name": "[Dev] Export update set XML",
+          "request": {
+            "auth": {
+              "type": "basic",
+              "basic": [
+                { "key": "username", "value": "{{SN_DEV_USER}}", "type": "string" },
+                { "key": "password", "value": "{{SN_DEV_PASS}}", "type": "string" }
+              ]
+            },
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/xml" }
+            ],
+            "url": {
+              "raw": "https://{{SN_DEV_INSTANCE}}.service-now.com/sys_update_set_export_xml.do?sysparm_sys_id={{SYS_ID}}",
+              "protocol": "https",
+              "host": ["{{SN_DEV_INSTANCE}}", "service-now", "com"],
+              "path": ["sys_update_set_export_xml.do"],
+              "query": [
+                { "key": "sysparm_sys_id", "value": "{{SYS_ID}}" }
+              ]
+            },
+            "description": "Downloads the update set as an XML file using the legacy Jelly processor endpoint.\n\n**Script:** `export.py` (`client.get_raw`)\n\n**Expected response:** `Content-Type: application/xml` with an `<unload>` root element.\n\n**If you get HTML:** The server-side session was not established. Make sure you ran the Verify request above first in the same Postman session (not a fresh collection run). Alternatively, log in to dev in a browser to wake a hibernating PDI, then retry.\n\n**Save the response:** Click Save Response → Save to a file. Note the path — you will upload it in step 4."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "4 · Import",
+      "description": "Mirrors import_set.py — uploads the exported XML to test and confirms the resulting remote update set record.",
+      "item": [
+        {
+          "name": "[Test] Upload XML file",
+          "request": {
+            "auth": {
+              "type": "basic",
+              "basic": [
+                { "key": "username", "value": "{{SN_TEST_USER}}", "type": "string" },
+                { "key": "password", "value": "{{SN_TEST_PASS}}", "type": "string" }
+              ]
+            },
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "",
+                  "description": "Select the XML file saved from '3 · Export > Export update set XML'. Typically /tmp/update_set_<SYS_ID>.xml on a runner, or wherever you saved it locally."
+                }
+              ]
+            },
+            "url": {
+              "raw": "https://{{SN_TEST_INSTANCE}}.service-now.com/sys_update_set_upload.do",
+              "protocol": "https",
+              "host": ["{{SN_TEST_INSTANCE}}", "service-now", "com"],
+              "path": ["sys_update_set_upload.do"]
+            },
+            "description": "Uploads the XML file to test via the legacy multipart import processor.\n\n**Script:** `import_set.py` (`client.upload_xml`)\n\n**To use in Postman:** Click the file input in the Body tab and select the XML saved from the export step.\n\n**Expected response:** HTTP 200 (the processor returns 200 even on partial failures — run the Verify Import request next to confirm the record was created)."
+          },
+          "response": []
+        },
+        {
+          "name": "[Test] Verify import — find loaded remote update set",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "    var json = pm.response.json();",
+                  "    if (json.result && json.result.length > 0) {",
+                  "        var record = json.result[0];",
+                  "        pm.collectionVariables.set('REMOTE_SYS_ID', record.sys_id);",
+                  "        console.log('[Auto] REMOTE_SYS_ID → ' + record.sys_id + '  (state: ' + record.state + ')');",
+                  "        pm.test('Remote update set found in loaded state', function () {",
+                  "            pm.expect(record.state).to.equal('loaded');",
+                  "        });",
+                  "    } else {",
+                  "        console.error('[Error] No loaded remote update set found for SET_NAME=' + pm.collectionVariables.get('SET_NAME') + '. The upload may have failed silently.');",
+                  "        pm.test('Remote update set found', function () { pm.expect(json.result.length).to.be.above(0); });",
+                  "    }",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "basic",
+              "basic": [
+                { "key": "username", "value": "{{SN_TEST_USER}}", "type": "string" },
+                { "key": "password", "value": "{{SN_TEST_PASS}}", "type": "string" }
+              ]
+            },
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "https://{{SN_TEST_INSTANCE}}.service-now.com/api/now/table/sys_remote_update_set?sysparm_query=name={{SET_NAME}}^state=loaded&sysparm_fields=sys_id,name,state&sysparm_orderbydesc=sys_created_on&sysparm_limit=1",
+              "protocol": "https",
+              "host": ["{{SN_TEST_INSTANCE}}", "service-now", "com"],
+              "path": ["api", "now", "table", "sys_remote_update_set"],
+              "query": [
+                { "key": "sysparm_query", "value": "name={{SET_NAME}}^state=loaded", "description": "Name match AND state=loaded" },
+                { "key": "sysparm_fields", "value": "sys_id,name,state" },
+                { "key": "sysparm_orderbydesc", "value": "sys_created_on", "description": "Most recently created first, in case the set was imported multiple times" },
+                { "key": "sysparm_limit", "value": "1" }
+              ]
+            },
+            "description": "Confirms the upload created a `sys_remote_update_set` record in `loaded` state.\n\n**Script:** `import_set.py` (post-upload verification)\n\n**Wait:** The import processor is asynchronous — run this request a few seconds after the upload. The pipeline uses `time.sleep(3)` between upload and this check.\n\n**Post-response:** sets `REMOTE_SYS_ID` from the result."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "5 · Preview",
+      "description": "Mirrors trigger_preview.py and poll_preview.py — starts collision detection on test and polls until complete.",
+      "item": [
+        {
+          "name": "[Test] Trigger preview",
+          "request": {
+            "auth": {
+              "type": "basic",
+              "basic": [
+                { "key": "username", "value": "{{SN_TEST_USER}}", "type": "string" },
+                { "key": "password", "value": "{{SN_TEST_PASS}}", "type": "string" }
+              ]
+            },
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "raw",
+              "raw": ""
+            },
+            "url": {
+              "raw": "https://{{SN_TEST_INSTANCE}}.service-now.com/sys_remote_update_set_preview.do?sysparm_sys_id={{REMOTE_SYS_ID}}",
+              "protocol": "https",
+              "host": ["{{SN_TEST_INSTANCE}}", "service-now", "com"],
+              "path": ["sys_remote_update_set_preview.do"],
+              "query": [
+                { "key": "sysparm_sys_id", "value": "{{REMOTE_SYS_ID}}" }
+              ]
+            },
+            "description": "Starts the collision-detection preview for the remote update set. The processor runs asynchronously — this call only kicks it off.\n\n**Script:** `trigger_preview.py` (`client.post`)\n\n**Expected response:** HTTP 200 (even if the body is empty or HTML). Use 'Poll preview state' to track progress."
+          },
+          "response": []
+        },
+        {
+          "name": "[Test] Poll preview state",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "    var json = pm.response.json();",
+                  "    var state = json.result && json.result.state;",
+                  "    console.log('[Poll] Preview state: ' + state);",
+                  "    pm.test('Preview state', function () {",
+                  "        pm.expect(['previewed', 'loaded', 'previewing', 'error']).to.include(state);",
+                  "    });",
+                  "    if (state === 'previewed') {",
+                  "        console.log('[Poll] Preview complete — safe to proceed to Commit.');",
+                  "    } else if (state === 'error') {",
+                  "        console.error('[Poll] Preview ended in error. Open test → Retrieved Update Sets to investigate.');",
+                  "    } else {",
+                  "        console.log('[Poll] Still running. Re-send this request in a few seconds.');",
+                  "    }",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "basic",
+              "basic": [
+                { "key": "username", "value": "{{SN_TEST_USER}}", "type": "string" },
+                { "key": "password", "value": "{{SN_TEST_PASS}}", "type": "string" }
+              ]
+            },
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "https://{{SN_TEST_INSTANCE}}.service-now.com/api/now/table/sys_remote_update_set/{{REMOTE_SYS_ID}}?sysparm_fields=sys_id,name,state",
+              "protocol": "https",
+              "host": ["{{SN_TEST_INSTANCE}}", "service-now", "com"],
+              "path": ["api", "now", "table", "sys_remote_update_set", "{{REMOTE_SYS_ID}}"],
+              "query": [
+                { "key": "sysparm_fields", "value": "sys_id,name,state" }
+              ]
+            },
+            "description": "Checks the current state of the remote update set. Re-send every 10 seconds until `state` is `previewed`.\n\n**Script:** `poll_preview.py` (poll loop iteration)\n\n**State transitions:** `loaded` → `previewing` → `previewed` (or `error`)\n\n**Post-response:** logs state and guidance."
+          },
+          "response": []
+        },
+        {
+          "name": "[Test] List preview conflicts",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "    var json = pm.response.json();",
+                  "    var conflicts = json.result || [];",
+                  "    pm.test('No preview conflicts', function () {",
+                  "        pm.expect(conflicts.length).to.equal(0);",
+                  "    });",
+                  "    if (conflicts.length > 0) {",
+                  "        console.error('[Conflicts] ' + conflicts.length + ' conflict(s) found. Resolve before committing:');",
+                  "        conflicts.forEach(function(c) {",
+                  "            console.error('  - ' + (c.description || '(no description)'));",
+                  "        });",
+                  "    } else {",
+                  "        console.log('[Conflicts] None — safe to commit.');",
+                  "    }",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "basic",
+              "basic": [
+                { "key": "username", "value": "{{SN_TEST_USER}}", "type": "string" },
+                { "key": "password", "value": "{{SN_TEST_PASS}}", "type": "string" }
+              ]
+            },
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "https://{{SN_TEST_INSTANCE}}.service-now.com/api/now/table/sys_update_preview_problem?sysparm_query=remote_update_set={{REMOTE_SYS_ID}}^type=conflict&sysparm_fields=sys_id,type,description&sysparm_limit=50",
+              "protocol": "https",
+              "host": ["{{SN_TEST_INSTANCE}}", "service-now", "com"],
+              "path": ["api", "now", "table", "sys_update_preview_problem"],
+              "query": [
+                { "key": "sysparm_query", "value": "remote_update_set={{REMOTE_SYS_ID}}^type=conflict", "description": "Conflict-type problems only for this remote update set" },
+                { "key": "sysparm_fields", "value": "sys_id,type,description" },
+                { "key": "sysparm_limit", "value": "50" }
+              ]
+            },
+            "description": "Checks for collision-type preview problems after preview completes. Run this after `state` reaches `previewed`.\n\n**Script:** `poll_preview.py` (post-poll conflict check)\n\n**Expected result:** Empty `result` array. If any conflicts appear, resolve them manually in test (System Update Sets → Retrieved Update Sets) before running the pipeline."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "6 · Commit",
+      "description": "Mirrors commit.py — triggers the commit on test and polls until the state reaches 'committed'.",
+      "item": [
+        {
+          "name": "[Test] Trigger commit",
+          "request": {
+            "auth": {
+              "type": "basic",
+              "basic": [
+                { "key": "username", "value": "{{SN_TEST_USER}}", "type": "string" },
+                { "key": "password", "value": "{{SN_TEST_PASS}}", "type": "string" }
+              ]
+            },
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "raw",
+              "raw": ""
+            },
+            "url": {
+              "raw": "https://{{SN_TEST_INSTANCE}}.service-now.com/sys_remote_update_set_commit.do?sysparm_sys_id={{REMOTE_SYS_ID}}&sysparm_ck=",
+              "protocol": "https",
+              "host": ["{{SN_TEST_INSTANCE}}", "service-now", "com"],
+              "path": ["sys_remote_update_set_commit.do"],
+              "query": [
+                { "key": "sysparm_sys_id", "value": "{{REMOTE_SYS_ID}}" },
+                { "key": "sysparm_ck", "value": "", "description": "CSRF token — empty string is accepted by the processor" }
+              ]
+            },
+            "description": "Triggers the commit of the previewed update set on test. The processor runs asynchronously.\n\n**Script:** `commit.py` (`client.post`)\n\n**Expected response:** HTTP 200. Use 'Poll commit state' to track progress."
+          },
+          "response": []
+        },
+        {
+          "name": "[Test] Poll commit state",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "    var json = pm.response.json();",
+                  "    var state = json.result && json.result.state;",
+                  "    console.log('[Poll] Commit state: ' + state);",
+                  "    pm.test('Commit state', function () {",
+                  "        pm.expect(['committed', 'previewed', 'committing', 'error']).to.include(state);",
+                  "    });",
+                  "    if (state === 'committed') {",
+                  "        console.log('[Poll] Committed successfully. Update set is live on test.');",
+                  "    } else if (state === 'error') {",
+                  "        console.error('[Poll] Commit ended in error. Check test → Retrieved Update Sets.');",
+                  "    } else {",
+                  "        console.log('[Poll] Still running. Re-send this request in a few seconds.');",
+                  "    }",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "basic",
+              "basic": [
+                { "key": "username", "value": "{{SN_TEST_USER}}", "type": "string" },
+                { "key": "password", "value": "{{SN_TEST_PASS}}", "type": "string" }
+              ]
+            },
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "https://{{SN_TEST_INSTANCE}}.service-now.com/api/now/table/sys_remote_update_set/{{REMOTE_SYS_ID}}?sysparm_fields=state,name",
+              "protocol": "https",
+              "host": ["{{SN_TEST_INSTANCE}}", "service-now", "com"],
+              "path": ["api", "now", "table", "sys_remote_update_set", "{{REMOTE_SYS_ID}}"],
+              "query": [
+                { "key": "sysparm_fields", "value": "state,name" }
+              ]
+            },
+            "description": "Polls the commit state. Re-send every 10 seconds until `state` is `committed`.\n\n**Script:** `commit.py` (poll loop iteration)\n\n**State transitions:** `previewed` → `committing` → `committed` (or `error`)"
+          },
+          "response": []
+        }
+      ]
+    }
+  ]
+}
