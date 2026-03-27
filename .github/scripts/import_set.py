@@ -24,11 +24,19 @@ SET_NAME    = os.environ['SET_NAME']
 
 client = ServiceNowClient.from_env()
 
+# Prime the requests.Session cookie before calling the .do upload endpoint.
+# Without a prior authenticated Table API call the Jelly processor silently
+# redirects to the login page; allow_redirects=True means the final status
+# is 200 regardless, so we'd never see the failure.
+client.get_json('/api/now/table/sys_update_set?sysparm_limit=1&sysparm_fields=sys_id')
+
 # Upload the XML file via multipart form POST.
 # The upload endpoint is a legacy processor that accepts the same form the
 # ServiceNow UI submits when you manually import an update set.
-status = client.upload_xml('/sys_update_set_upload.do', EXPORT_FILE)
-print(f'Import HTTP status: {status}')
+resp = client.upload_xml('/sys_update_set_upload.do', EXPORT_FILE)
+print(f'Import HTTP status: {resp.status_code}')
+print(f'Final URL after redirects: {resp.url}')
+print(f'Response body (first 1500 chars): {resp.text[:1500].replace(chr(10), " ")}')
 
 # Poll for the sys_remote_update_set record.
 # The upload endpoint returns before the background processor finishes writing

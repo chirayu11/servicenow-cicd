@@ -143,4 +143,5 @@ except ET.ParseError as e:
     sys.exit(1)
 
 print(f'Exported {len(content):,} bytes of XML to {EXPORT_FILE}')
+print(f'First 800 bytes of generated XML:\n{content[:800].decode("utf-8", errors="replace")}')
 gha_output('export_file', EXPORT_FILE)

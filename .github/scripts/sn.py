@@ -69,20 +69,19 @@ class ServiceNowClient:
         resp = self._session.post(url, data=b'', timeout=120)
         resp.raise_for_status()
 
-    def upload_xml(self, path: str, file_path: str) -> int:
+    def upload_xml(self, path: str, file_path: str) -> requests.Response:
         """
         POST a multipart/form-data XML file upload.
-        Returns the HTTP status code.
+        Returns the full Response so callers can inspect status_code, url, and text.
         """
         url = self.base_url + path
         with open(file_path, 'rb') as f:
-            resp = self._session.post(
+            return self._session.post(
                 url,
                 files={'file': ('update_set.xml', f, 'application/xml')},
                 allow_redirects=True,
                 timeout=120,
             )
-        return resp.status_code
 
 
 # ---------------------------------------------------------------------------

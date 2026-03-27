@@ -168,6 +168,14 @@ jobs:
           SET_NAME: ${{ matrix.update_set.name }}
         run: python3 .github/scripts/export.py
 
+      - name: "Upload export XML artifact (debug)"
+        if: steps.precheck.outputs.action == 'deploy'
+        uses: actions/upload-artifact@v4
+        with:
+          name: update-set-xml-${{ matrix.update_set.sys_id }}
+          path: ${{ steps.export.outputs.export_file }}
+          retention-days: 3
+
       # -----------------------------------------------------------------------
       # Step 2: Import
       # Uploads the XML to test via the update set upload form endpoint.
