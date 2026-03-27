@@ -19,6 +19,7 @@ Writes to $GITHUB_OUTPUT:
 """
 import html
 import os
+import re
 import sys
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -96,6 +97,10 @@ def xe(s: str) -> str:
     """XML-escape a string value for use as element text content."""
     return html.escape(str(s or ''), quote=False)
 
+# Each payload is stored as a standalone XML document, so it starts with its
+# own <?xml ...?> declaration. Strip that before embedding inside <unload>.
+_XML_DECL = re.compile(r'^\s*<\?xml[^?]*\?>\s*', re.IGNORECASE)
+
 unload_date = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
 
 lines = [
@@ -110,7 +115,7 @@ lines = [
 ]
 
 for r in records:
-    payload = r.get('payload', '').strip()
+    payload = _XML_DECL.sub('', r.get('payload', '')).strip()
     if payload:
         lines.append(payload)
 
