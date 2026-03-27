@@ -16,7 +16,8 @@ Required env vars:
 import os
 import sys
 import time
-import urllib.error
+
+import requests
 
 from sn import ServiceNowClient, gha_summary
 
@@ -37,9 +38,9 @@ try:
     client.post(
         f'/sys_remote_update_set_commit.do?sysparm_sys_id={REMOTE_SYS_ID}&sysparm_ck='
     )
-except urllib.error.HTTPError as e:
+except requests.exceptions.HTTPError as e:
     print(
-        f'::warning::Commit trigger returned HTTP {e.code}. '
+        f'::warning::Commit trigger returned HTTP {e.response.status_code}. '
         'Polling to check whether the commit proceeded...'
     )
 

@@ -252,10 +252,10 @@
     },
     {
       "name": "3 · Export",
-      "description": "Mirrors export.py — verifies the update set on dev and downloads it as XML.\n\nRun the Verify request first. It confirms the set exists and is in 'complete' state. Because the pipeline uses requests.Session, the Verify call also establishes the server-side session cookie required by the legacy Export endpoint.",
+      "description": "Mirrors export.py — queries the dev REST API to reconstruct the standard ServiceNow unload XML.\n\nThe pipeline no longer uses the legacy /sys_update_set_export_xml.do endpoint because it requires a browser-level web session that Basic Auth cannot establish in CI. Instead, it fetches the update set record and all change payloads from the Table API and assembles the XML locally.\n\nRun both requests in order. The second request returns the raw change payloads — the pipeline assembles these into XML; in Postman you are inspecting the raw data.",
       "item": [
         {
-          "name": "[Dev] Verify update set exists and state",
+          "name": "[Dev] Fetch update set metadata",
           "event": [
             {
               "listen": "test",
@@ -273,11 +273,11 @@
                   "    pm.test('Update set found on dev', function () { pm.expect(result.sys_id).to.be.a('string'); });",
                   "    pm.test('Update set state is complete', function () {",
                   "        if (result.state !== 'complete') {",
-                  "            console.warn('[Warning] State is \"' + result.state + '\", expected \"complete\". Export may fail.');",
+                  "            console.warn('[Warning] State is \"' + result.state + '\", expected \"complete\".');",
                   "        }",
                   "        pm.expect(result.state).to.equal('complete');",
                   "    });",
-                  "    console.log('[Verify] ' + result.name + '  state=' + result.state + '  sys_id=' + result.sys_id);",
+                  "    console.log('[Export] ' + result.name + '  state=' + result.state + '  sys_id=' + result.sys_id);",
                   "}"
                 ]
               }
@@ -296,20 +296,41 @@
               { "key": "Accept", "value": "application/json" }
             ],
             "url": {
-              "raw": "https://{{SN_DEV_INSTANCE}}.service-now.com/api/now/table/sys_update_set/{{SYS_ID}}?sysparm_fields=sys_id,name,state",
+              "raw": "https://{{SN_DEV_INSTANCE}}.service-now.com/api/now/table/sys_update_set/{{SYS_ID}}?sysparm_fields=sys_id,name,description,state",
               "protocol": "https",
               "host": ["{{SN_DEV_INSTANCE}}", "service-now", "com"],
               "path": ["api", "now", "table", "sys_update_set", "{{SYS_ID}}"],
               "query": [
-                { "key": "sysparm_fields", "value": "sys_id,name,state" }
+                { "key": "sysparm_fields", "value": "sys_id,name,description,state" }
               ]
             },
-            "description": "Fetches the update set record by sys_id to confirm it exists and is in `complete` state before attempting the XML export.\n\n**Script:** `export.py` (verify step, added to fix session priming)\n\n**Why this matters:** The export `.do` endpoint requires a server-side session cookie. In the pipeline, `requests.Session` carries this cookie from this Table API call into the next `.do` call automatically. In Postman, run this request **in the same session** before the Export XML request."
+            "description": "Fetches the update set record (name, description, state) which becomes the `<sys_update_set>` element in the reconstructed XML.\n\n**Script:** `export.py` (step 1)"
           },
           "response": []
         },
         {
-          "name": "[Dev] Export update set XML",
+          "name": "[Dev] Fetch change records (sys_update_xml payloads)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "    var json = pm.response.json();",
+                  "    var count = (json.result || []).length;",
+                  "    pm.test('At least one change record found', function () {",
+                  "        pm.expect(count).to.be.above(0);",
+                  "    });",
+                  "    console.log('[Export] ' + count + ' change record(s) found.');",
+                  "    if (count === 10000) {",
+                  "        console.warn('[Export] Fetched exactly 10 000 records — update set may exceed the limit.');",
+                  "    }",
+                  "}"
+                ]
+              }
+            }
+          ],
           "request": {
             "auth": {
               "type": "basic",
@@ -320,18 +341,21 @@
             },
             "method": "GET",
             "header": [
-              { "key": "Accept", "value": "application/xml" }
+              { "key": "Accept", "value": "application/json" }
             ],
             "url": {
-              "raw": "https://{{SN_DEV_INSTANCE}}.service-now.com/sys_update_set_export_xml.do?sysparm_sys_id={{SYS_ID}}",
+              "raw": "https://{{SN_DEV_INSTANCE}}.service-now.com/api/now/table/sys_update_xml?sysparm_query=update_set={{SYS_ID}}&sysparm_fields=payload&sysparm_orderby=sys_created_on&sysparm_limit=10000",
               "protocol": "https",
               "host": ["{{SN_DEV_INSTANCE}}", "service-now", "com"],
-              "path": ["sys_update_set_export_xml.do"],
+              "path": ["api", "now", "table", "sys_update_xml"],
               "query": [
-                { "key": "sysparm_sys_id", "value": "{{SYS_ID}}" }
+                { "key": "sysparm_query", "value": "update_set={{SYS_ID}}", "description": "All change records belonging to this update set" },
+                { "key": "sysparm_fields", "value": "payload", "description": "payload contains the complete XML element for each changed record" },
+                { "key": "sysparm_orderby", "value": "sys_created_on", "description": "Oldest first — preserves dependency order" },
+                { "key": "sysparm_limit", "value": "10000" }
               ]
             },
-            "description": "Downloads the update set as an XML file using the legacy Jelly processor endpoint.\n\n**Script:** `export.py` (`client.get_raw`)\n\n**Expected response:** `Content-Type: application/xml` with an `<unload>` root element.\n\n**If you get HTML:** The server-side session was not established. Make sure you ran the Verify request above first in the same Postman session (not a fresh collection run). Alternatively, log in to dev in a browser to wake a hibernating PDI, then retry.\n\n**Save the response:** Click Save Response → Save to a file. Note the path — you will upload it in step 4."
+            "description": "Fetches the `payload` field from every `sys_update_xml` record in this update set. Each payload is a complete XML element (e.g. `<sys_script action=\"INSERT_OR_UPDATE\">...</sys_script>`) that the pipeline wraps inside an `<unload>` element to reconstruct the standard export format.\n\n**Script:** `export.py` (step 2)\n\n**Note:** You are seeing the raw JSON here. The pipeline assembles these payloads into the final XML file that gets uploaded in step 4."
           },
           "response": []
         }

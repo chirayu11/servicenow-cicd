@@ -13,7 +13,8 @@ Required env vars:
                    (resolved by the workflow as: precheck.remote_sys_id || import_set.remote_sys_id)
 """
 import os
-import urllib.error
+
+import requests
 
 from sn import ServiceNowClient
 
@@ -25,11 +26,11 @@ client = ServiceNowClient.from_env()
 # ServiceNow UI calls when you click the "Preview" button.
 try:
     client.post(f'/sys_remote_update_set_preview.do?sysparm_sys_id={REMOTE_SYS_ID}')
-except urllib.error.HTTPError as e:
+except requests.exceptions.HTTPError as e:
     # Non-fatal: the preview may still have started. poll_preview.py will
     # detect if it did not by watching the state field.
     print(
-        f'::warning::Preview trigger returned HTTP {e.code}. '
+        f'::warning::Preview trigger returned HTTP {e.response.status_code}. '
         'The poll step will confirm whether preview started.'
     )
 
