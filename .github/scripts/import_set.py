@@ -30,29 +30,39 @@ client = ServiceNowClient.from_env()
 status = client.upload_xml('/sys_update_set_upload.do', EXPORT_FILE)
 print(f'Import HTTP status: {status}')
 
-# Allow the server-side processor time to write the sys_remote_update_set record.
-# The upload endpoint returns before the background script finishes.
-time.sleep(3)
+# Poll for the sys_remote_update_set record.
+# The upload endpoint returns before the background processor finishes writing
+# the record, so we retry rather than using a fixed sleep.
+MAX_WAIT = 30
+INTERVAL = 3
 
-# Locate the newly-created remote update set record by name + state=loaded.
-# Descending order ensures the most recently created record comes first,
-# which matters if the set was previously imported and left in loaded state.
 encoded_name = urllib.parse.quote(SET_NAME)
-results = client.get_json(
-    f'/api/now/table/sys_remote_update_set'
-    f'?sysparm_query=name%3D{encoded_name}%5EstateLOADloaded'
-    f'&sysparm_fields=sys_id,name,state'
-    f'&sysparm_orderbydesc=sys_created_on'
-    f'&sysparm_limit=1'
-).get('result', [])
+elapsed = 0
+results = []
 
-if not results:
-    print(
-        f"::error::Could not locate the imported sys_remote_update_set record for '{SET_NAME}' on test. "
-        "This may mean the upload failed silently or the name does not match exactly."
-    )
-    sys.exit(1)
+while True:
+    results = client.get_json(
+        f'/api/now/table/sys_remote_update_set'
+        f'?sysparm_query=name%3D{encoded_name}'
+        f'&sysparm_fields=sys_id,name,state'
+        f'&sysparm_orderbydesc=sys_created_on'
+        f'&sysparm_limit=1'
+    ).get('result', [])
+
+    if results:
+        break
+
+    if elapsed >= MAX_WAIT:
+        print(
+            f"::error::Could not locate the imported sys_remote_update_set record for '{SET_NAME}' on test "
+            f"after {MAX_WAIT}s. This may mean the upload failed silently or the name does not match exactly."
+        )
+        sys.exit(1)
+
+    print(f'Record not found yet ({elapsed}s elapsed), retrying in {INTERVAL}s...')
+    time.sleep(INTERVAL)
+    elapsed += INTERVAL
 
 remote_sys_id = results[0]['sys_id']
-print(f'Found remote update set on test: {remote_sys_id}')
+print(f"Found remote update set on test: {remote_sys_id} (state: {results[0]['state']})")
 gha_output('remote_sys_id', remote_sys_id)
