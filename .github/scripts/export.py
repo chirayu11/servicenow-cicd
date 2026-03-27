@@ -106,12 +106,18 @@ unload_date = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
 lines = [
     '<?xml version="1.0" encoding="UTF-8"?>',
     f'<unload unload_date="{unload_date}">',
+    # Every element in a ServiceNow unload file is wrapped in <record_update
+    # table="...">. The import processor uses the table attribute to decide
+    # what record type to create — without this wrapper it silently ignores
+    # the element and never creates the sys_remote_update_set record.
+    '<record_update sys_domain="global" table="sys_update_set">',
     '<sys_update_set action="INSERT_OR_UPDATE">',
     f'<description>{xe(us.get("description", ""))}</description>',
     f'<name>{xe(us.get("name", SET_NAME))}</name>',
     f'<state>{xe(state)}</state>',
     f'<sys_id>{xe(us.get("sys_id", SYS_ID))}</sys_id>',
     '</sys_update_set>',
+    '</record_update>',
 ]
 
 for r in records:
