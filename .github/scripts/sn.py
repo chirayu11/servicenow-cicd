@@ -8,6 +8,7 @@ own directory to sys.path when run directly, importing is simply:
     from sn import ServiceNowClient, gha_output, gha_output_multiline, gha_summary
 """
 import os
+import re
 import sys
 
 import requests
@@ -71,14 +72,31 @@ class ServiceNowClient:
 
     def upload_xml(self, path: str, file_path: str) -> requests.Response:
         """
-        POST a multipart/form-data XML file upload.
+        POST a multipart/form-data XML file upload to a legacy .do processor.
+
+        ServiceNow Jelly processors require a CSRF token (sysparm_ck / g_ck).
+        Without it the processor re-renders the form page with HTTP 200 and
+        creates nothing. We GET the page first to extract the token, then POST.
+
         Returns the full Response so callers can inspect status_code, url, and text.
         """
         url = self.base_url + path
+
+        # Extract the CSRF token from the upload form page.
+        page = self._session.get(url, timeout=60)
+        m = re.search(r"var g_ck\s*=\s*['\"]([a-f0-9]+)['\"]", page.text)
+        if m:
+            sysparm_ck = m.group(1)
+            print(f'Extracted sysparm_ck: {sysparm_ck[:8]}…')
+        else:
+            sysparm_ck = ''
+            print('::warning::Could not extract sysparm_ck from upload page — proceeding without CSRF token.')
+
         with open(file_path, 'rb') as f:
             return self._session.post(
                 url,
-                files={'file': ('update_set.xml', f, 'application/xml')},
+                data={'sysparm_ck': sysparm_ck},
+                files={'attachmentFile': ('update_set.xml', f, 'application/xml')},
                 allow_redirects=True,
                 timeout=120,
             )
