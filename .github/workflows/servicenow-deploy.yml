@@ -152,21 +152,21 @@ jobs:
 
       # -----------------------------------------------------------------------
       # Step 1: Transfer
-      # Reads change records from dev via the Table API and creates the
-      # corresponding sys_remote_update_set + sys_update_xml records on test.
-      # No XML file is generated; no legacy .do endpoint is used.
+      # Calls the CI/CD Update Set Retrieve API on test. Test pulls the update
+      # set directly from dev using credentials stored in a pre-configured
+      # Remote Update Source (sys_update_set_source) record on test.
+      # Setup: System Update Sets → Update Sources → New (on test instance).
+      #        Store the record's sys_id as secret SN_DEV_UPDATE_SOURCE_ID.
       # Skipped when resuming from a partial state (set already exists on test).
       # -----------------------------------------------------------------------
       - name: "1/5 — Transfer update set to test"
         id: transfer
         if: steps.precheck.outputs.action == 'deploy'
         env:
-          SN_DEV_INSTANCE: ${{ secrets.SN_DEV_INSTANCE }}
-          SN_DEV_USER: ${{ secrets.SN_DEV_USERNAME }}
-          SN_DEV_PASS: ${{ secrets.SN_DEV_PASSWORD }}
           SN_TEST_INSTANCE: ${{ secrets.SN_TEST_INSTANCE }}
           SN_TEST_USER: ${{ secrets.SN_TEST_USERNAME }}
           SN_TEST_PASS: ${{ secrets.SN_TEST_PASSWORD }}
+          SN_DEV_UPDATE_SOURCE_ID: ${{ secrets.SN_DEV_UPDATE_SOURCE_ID }}
           SYS_ID: ${{ matrix.update_set.sys_id }}
           SET_NAME: ${{ matrix.update_set.name }}
         run: python3 .github/scripts/transfer.py
