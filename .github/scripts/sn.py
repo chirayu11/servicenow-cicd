@@ -9,6 +9,7 @@ own directory to sys.path when run directly, importing is simply:
 """
 import os
 import sys
+import time
 
 import requests
 
@@ -67,6 +68,41 @@ class ServiceNowClient:
         url = self.base_url + path
         resp = self._session.post(url, data=b'', timeout=120)
         resp.raise_for_status()
+
+    def poll_progress(
+        self,
+        progress_id: str,
+        timeout: int = 300,
+        interval: int = 10,
+        operation: str = 'operation',
+    ) -> None:
+        """
+        Poll a CI/CD progress record until it succeeds.
+        Prints progress to stdout. Exits with code 1 on failure or timeout.
+
+        Status codes: 0=Pending, 1=Running, 2=Successful, 3=Failed, 4=Cancelled
+        """
+        elapsed = 0
+        while True:
+            prog         = self.get_json(f'/api/sn_cicd/progress/{progress_id}').get('result', {})
+            status       = int(prog.get('status', 0))
+            pct          = prog.get('percent_complete', 0)
+            status_label = prog.get('status_label', '')
+            print(f'  [{elapsed}s] {pct}% — {status_label}')
+
+            if status == 2:
+                return
+            if status >= 3:
+                detail = prog.get('status_detail') or prog.get('error') or prog.get('status_message', '')
+                print(f'::error::{operation} failed ({status_label}): {detail}')
+                sys.exit(1)
+
+            if elapsed >= timeout:
+                print(f'::error::{operation} timed out after {timeout}s.')
+                sys.exit(1)
+
+            time.sleep(interval)
+            elapsed += interval
 
 
 # ---------------------------------------------------------------------------

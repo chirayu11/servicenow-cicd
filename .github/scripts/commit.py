@@ -11,15 +11,11 @@ Required env vars:
 """
 import os
 import sys
-import time
 
 from sn import ServiceNowClient, gha_summary
 
 REMOTE_SYS_ID = os.environ['REMOTE_SYS_ID']
 SET_NAME      = os.environ['SET_NAME']
-
-TIMEOUT  = 60
-INTERVAL = 10
 
 client = ServiceNowClient.from_env()
 
@@ -39,33 +35,12 @@ except (KeyError, TypeError):
 print(f'Commit triggered. Progress: {progress_url}')
 
 # ---------------------------------------------------------------------------
-# Poll progress until committed
-# Status: 0=Pending, 1=Running, 2=Successful, 3=Failed, 4=Cancelled
+# Poll until committed
 # ---------------------------------------------------------------------------
-elapsed = 0
+client.poll_progress(progress_id, timeout=300, operation=f"Commit of '{SET_NAME}'")
 
-while True:
-    prog   = client.get_json(f'/api/sn_cicd/progress/{progress_id}').get('result', {})
-    status = int(prog.get('status', 0))
-    pct    = prog.get('percent_complete', 0)
-    label  = prog.get('status_label', '')
-    print(f'[{elapsed}s] {pct}% — {label}')
-
-    if status == 2:
-        print(f"::notice::Successfully committed '{SET_NAME}' to test.")
-        gha_summary(
-            f'### Committed: `{SET_NAME}`\n'
-            f'- Remote sys_id on test: `{REMOTE_SYS_ID}`\n'
-        )
-        sys.exit(0)
-    if status >= 3:
-        detail = prog.get('status_detail') or prog.get('error') or prog.get('status_message', '')
-        print(f"::error::Commit failed ({label}): {detail}")
-        sys.exit(1)
-
-    if elapsed >= TIMEOUT:
-        print(f"::error::Commit timed out after {TIMEOUT}s.")
-        sys.exit(1)
-
-    time.sleep(INTERVAL)
-    elapsed += INTERVAL
+print(f"::notice::Successfully committed '{SET_NAME}' to test.")
+gha_summary(
+    f'### Committed: `{SET_NAME}`\n'
+    f'- Remote sys_id on test: `{REMOTE_SYS_ID}`\n'
+)

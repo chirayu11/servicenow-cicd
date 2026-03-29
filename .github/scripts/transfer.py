@@ -23,7 +23,6 @@ Writes to $GITHUB_OUTPUT:
 """
 import os
 import sys
-import time
 import urllib.parse
 
 from sn import ServiceNowClient, gha_output
@@ -56,33 +55,9 @@ print(f'Retrieve triggered. Progress: {progress_url}')
 
 # ---------------------------------------------------------------------------
 # 2. Poll progress until complete
-# Status: 0=Pending, 1=Running, 2=Successful, 3=Failed, 4=Cancelled
 # ---------------------------------------------------------------------------
-MAX_WAIT = 300
-INTERVAL = 10
-elapsed  = 0
-
-while True:
-    prog   = test.get_json(f'/api/sn_cicd/progress/{progress_id}').get('result', {})
-    status = int(prog.get('status', 0))
-    pct    = prog.get('percent_complete', 0)
-    label  = prog.get('status_label', '')
-    print(f'  {pct}% — {label}')
-
-    if status == 2:
-        print('Retrieval completed successfully.')
-        break
-    if status >= 3:
-        detail = prog.get('status_detail') or prog.get('error') or prog.get('status_message', '')
-        print(f'::error::Retrieval failed ({label}): {detail}')
-        sys.exit(1)
-
-    if elapsed >= MAX_WAIT:
-        print(f'::error::Retrieval timed out after {MAX_WAIT}s.')
-        sys.exit(1)
-
-    time.sleep(INTERVAL)
-    elapsed += INTERVAL
+test.poll_progress(progress_id, timeout=300, operation='Retrieval')
+print('Retrieval completed successfully.')
 
 # ---------------------------------------------------------------------------
 # 3. Locate the created sys_remote_update_set record on test

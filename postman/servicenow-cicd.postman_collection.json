@@ -2,7 +2,7 @@
   "info": {
     "_postman_id": "a1b2c3d4-0001-4c3d-8e9f-000000000001",
     "name": "ServiceNow CI/CD Pipeline",
-    "description": "Manual test suite mirroring every API call made by the GitHub Actions CI/CD pipeline.\n\n**Before you start:**\n1. Open the collection, go to Variables, and fill in all six credential variables.\n2. Set `SET_NAME` to the exact name of the update set you want to test.\n3. Run requests top-to-bottom — post-response scripts auto-populate `SYS_ID`, `REMOTE_SYS_ID`, etc. as you go.\n\nThe workflow order mirrors the pipeline: Discover → Precheck → Export → Import → Preview → Commit.",
+    "description": "Manual test suite mirroring every API call made by the GitHub Actions CI/CD pipeline.\n\n**Before you start:**\n1. Open the collection Variables tab and fill in all credential variables.\n2. Set `SET_NAME` to the exact name of the update set you want to test.\n3. Set `SN_DEV_UPDATE_SOURCE_ID` to the sys_id of the Remote Update Source record on test.\n4. Run requests top-to-bottom — post-response scripts auto-populate `SYS_ID`, `PROGRESS_ID`, `REMOTE_SYS_ID`, etc. as you go.\n\nThe workflow order mirrors the pipeline: Discover → Precheck → Transfer → Preview → Commit.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "auth": {
@@ -13,7 +13,7 @@
       "key": "SN_DEV_INSTANCE",
       "value": "",
       "type": "string",
-      "description": "Dev instance subdomain only, e.g. mycompany-dev (not the full URL)"
+      "description": "Dev instance subdomain only, e.g. dev12345 (not the full URL)"
     },
     {
       "key": "SN_DEV_USER",
@@ -31,7 +31,7 @@
       "key": "SN_TEST_INSTANCE",
       "value": "",
       "type": "string",
-      "description": "Test instance subdomain only, e.g. mycompany-test"
+      "description": "Test instance subdomain only, e.g. dev67890"
     },
     {
       "key": "SN_TEST_USER",
@@ -46,8 +46,14 @@
       "description": "Test admin password"
     },
     {
+      "key": "SN_DEV_UPDATE_SOURCE_ID",
+      "value": "",
+      "type": "string",
+      "description": "sys_id of the sys_update_set_source record on test. One-time setup: on test go to sys_update_set_source_list.do, create a record pointing at dev, copy its sys_id here."
+    },
+    {
       "key": "SET_NAME",
-      "value": "Demo Navigation Item",
+      "value": "Demo Announcement",
       "type": "string",
       "description": "Exact update set name. Auto-populated from the first result of '1 · Discover > [Dev] List complete update sets'."
     },
@@ -58,10 +64,16 @@
       "description": "sys_id of the local update set on dev. Auto-populated from '1 · Discover > [Dev] List complete update sets'."
     },
     {
+      "key": "PROGRESS_ID",
+      "value": "",
+      "type": "string",
+      "description": "sys_id of the CI/CD progress record. Auto-populated from '3 · Transfer > Trigger retrieval' and '5 · Commit > Trigger commit'."
+    },
+    {
       "key": "REMOTE_SYS_ID",
       "value": "",
       "type": "string",
-      "description": "sys_id of the remote update set record on test. Auto-populated from '2 · Precheck' or '4 · Import > Verify import'."
+      "description": "sys_id of the remote update set record on test. Auto-populated from '2 · Precheck' or '3 · Transfer > Verify remote update set'."
     }
   ],
   "item": [
@@ -178,7 +190,7 @@
                 { "key": "sysparm_limit", "value": "50" }
               ]
             },
-            "description": "Lists remote update sets on test that are partially deployed (imported but not yet committed).\n\n**Script:** `discover.py` (Query 3)\n\nSets in `loaded` state will resume from the Preview step. Sets in `previewed` state will resume from the Commit step."
+            "description": "Lists remote update sets on test that are partially deployed (retrieved but not yet committed).\n\n**Script:** `discover.py` (Query 3)\n\nSets in `loaded` state will resume from Preview. Sets in `previewed` state will resume from Commit."
           },
           "response": []
         }
@@ -238,7 +250,7 @@
               "host": ["{{SN_TEST_INSTANCE}}", "service-now", "com"],
               "path": ["api", "now", "table", "sys_remote_update_set"],
               "query": [
-                { "key": "sysparm_query", "value": "name={{SET_NAME}}", "description": "Exact name match — ServiceNow encodes this as name%3D{{SET_NAME}}" },
+                { "key": "sysparm_query", "value": "name={{SET_NAME}}", "description": "Exact name match" },
                 { "key": "sysparm_fields", "value": "sys_id,name,state" },
                 { "key": "sysparm_orderby", "value": "sys_created_on", "description": "Oldest first; script uses the last element as the most recent" },
                 { "key": "sysparm_limit", "value": "10" }
@@ -251,11 +263,11 @@
       ]
     },
     {
-      "name": "3 · Export",
-      "description": "Mirrors export.py — queries the dev REST API to reconstruct the standard ServiceNow unload XML.\n\nThe pipeline no longer uses the legacy /sys_update_set_export_xml.do endpoint because it requires a browser-level web session that Basic Auth cannot establish in CI. Instead, it fetches the update set record and all change payloads from the Table API and assembles the XML locally.\n\nRun both requests in order. The second request returns the raw change payloads — the pipeline assembles these into XML; in Postman you are inspecting the raw data.",
+      "name": "3 · Transfer",
+      "description": "Mirrors transfer.py — tells the test instance to pull the update set directly from dev using the CI/CD Update Set Retrieve API.\n\nPrerequisite: a Remote Update Source record must exist on test (`sys_update_set_source_list.do`) with dev credentials. Its sys_id goes in the `SN_DEV_UPDATE_SOURCE_ID` collection variable.\n\nRun all three requests in order: trigger retrieval → poll progress until status=2 → verify the remote record was created.",
       "item": [
         {
-          "name": "[Dev] Fetch update set metadata",
+          "name": "[Test] Trigger retrieval",
           "event": [
             {
               "listen": "test",
@@ -264,109 +276,24 @@
                 "exec": [
                   "if (pm.response.code === 200) {",
                   "    var json = pm.response.json();",
-                  "    var result = json.result;",
-                  "    if (!result || !result.sys_id) {",
-                  "        console.error('[Error] Update set ' + pm.collectionVariables.get('SYS_ID') + ' not found on dev.');",
-                  "        pm.test('Update set found on dev', function () { pm.expect(result).to.exist; });",
-                  "        return;",
-                  "    }",
-                  "    pm.test('Update set found on dev', function () { pm.expect(result.sys_id).to.be.a('string'); });",
-                  "    pm.test('Update set state is complete', function () {",
-                  "        if (result.state !== 'complete') {",
-                  "            console.warn('[Warning] State is \"' + result.state + '\", expected \"complete\".');",
-                  "        }",
-                  "        pm.expect(result.state).to.equal('complete');",
-                  "    });",
-                  "    console.log('[Export] ' + result.name + '  state=' + result.state + '  sys_id=' + result.sys_id);",
-                  "}"
-                ]
-              }
-            }
-          ],
-          "request": {
-            "auth": {
-              "type": "basic",
-              "basic": [
-                { "key": "username", "value": "{{SN_DEV_USER}}", "type": "string" },
-                { "key": "password", "value": "{{SN_DEV_PASS}}", "type": "string" }
-              ]
-            },
-            "method": "GET",
-            "header": [
-              { "key": "Accept", "value": "application/json" }
-            ],
-            "url": {
-              "raw": "https://{{SN_DEV_INSTANCE}}.service-now.com/api/now/table/sys_update_set/{{SYS_ID}}?sysparm_fields=sys_id,name,description,state",
-              "protocol": "https",
-              "host": ["{{SN_DEV_INSTANCE}}", "service-now", "com"],
-              "path": ["api", "now", "table", "sys_update_set", "{{SYS_ID}}"],
-              "query": [
-                { "key": "sysparm_fields", "value": "sys_id,name,description,state" }
-              ]
-            },
-            "description": "Fetches the update set record (name, description, state) which becomes the `<sys_update_set>` element in the reconstructed XML.\n\n**Script:** `export.py` (step 1)"
-          },
-          "response": []
-        },
-        {
-          "name": "[Dev] Fetch change records (sys_update_xml payloads)",
-          "event": [
-            {
-              "listen": "test",
-              "script": {
-                "type": "text/javascript",
-                "exec": [
-                  "if (pm.response.code === 200) {",
-                  "    var json = pm.response.json();",
-                  "    var count = (json.result || []).length;",
-                  "    pm.test('At least one change record found', function () {",
-                  "        pm.expect(count).to.be.above(0);",
-                  "    });",
-                  "    console.log('[Export] ' + count + ' change record(s) found.');",
-                  "    if (count === 10000) {",
-                  "        console.warn('[Export] Fetched exactly 10 000 records — update set may exceed the limit.');",
+                  "    try {",
+                  "        var progressId  = json.result.links.progress.id;",
+                  "        var progressUrl = json.result.links.progress.url;",
+                  "        pm.collectionVariables.set('PROGRESS_ID', progressId);",
+                  "        console.log('[Auto] PROGRESS_ID → ' + progressId);",
+                  "        console.log('[Transfer] Track progress at: ' + progressUrl);",
+                  "        pm.test('Progress ID returned', function () {",
+                  "            pm.expect(progressId).to.be.a('string').and.not.empty;",
+                  "        });",
+                  "    } catch (e) {",
+                  "        console.error('[Transfer] Unexpected response shape — check body for error details.');",
+                  "        pm.test('Progress link present in response', function () { pm.expect(false).to.be.true; });",
                   "    }",
                   "}"
                 ]
               }
             }
           ],
-          "request": {
-            "auth": {
-              "type": "basic",
-              "basic": [
-                { "key": "username", "value": "{{SN_DEV_USER}}", "type": "string" },
-                { "key": "password", "value": "{{SN_DEV_PASS}}", "type": "string" }
-              ]
-            },
-            "method": "GET",
-            "header": [
-              { "key": "Accept", "value": "application/json" }
-            ],
-            "url": {
-              "raw": "https://{{SN_DEV_INSTANCE}}.service-now.com/api/now/table/sys_update_xml?sysparm_query=update_set={{SYS_ID}}&sysparm_fields=payload&sysparm_orderby=sys_created_on&sysparm_limit=10000",
-              "protocol": "https",
-              "host": ["{{SN_DEV_INSTANCE}}", "service-now", "com"],
-              "path": ["api", "now", "table", "sys_update_xml"],
-              "query": [
-                { "key": "sysparm_query", "value": "update_set={{SYS_ID}}", "description": "All change records belonging to this update set" },
-                { "key": "sysparm_fields", "value": "payload", "description": "payload contains the complete XML element for each changed record" },
-                { "key": "sysparm_orderby", "value": "sys_created_on", "description": "Oldest first — preserves dependency order" },
-                { "key": "sysparm_limit", "value": "10000" }
-              ]
-            },
-            "description": "Fetches the `payload` field from every `sys_update_xml` record in this update set. Each payload is a complete XML element (e.g. `<sys_script action=\"INSERT_OR_UPDATE\">...</sys_script>`) that the pipeline wraps inside an `<unload>` element to reconstruct the standard export format.\n\n**Script:** `export.py` (step 2)\n\n**Note:** You are seeing the raw JSON here. The pipeline assembles these payloads into the final XML file that gets uploaded in step 4."
-          },
-          "response": []
-        }
-      ]
-    },
-    {
-      "name": "4 · Import",
-      "description": "Mirrors import_set.py — uploads the exported XML to test and confirms the resulting remote update set record.",
-      "item": [
-        {
-          "name": "[Test] Upload XML file",
           "request": {
             "auth": {
               "type": "basic",
@@ -376,30 +303,84 @@
               ]
             },
             "method": "POST",
-            "header": [],
+            "header": [
+              { "key": "Accept", "value": "application/json" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
             "body": {
-              "mode": "formdata",
-              "formdata": [
-                {
-                  "key": "file",
-                  "type": "file",
-                  "src": "",
-                  "description": "Select the XML file saved from '3 · Export > Export update set XML'. Typically /tmp/update_set_<SYS_ID>.xml on a runner, or wherever you saved it locally."
-                }
-              ]
+              "mode": "raw",
+              "raw": "{}"
             },
             "url": {
-              "raw": "https://{{SN_TEST_INSTANCE}}.service-now.com/sys_update_set_upload.do",
+              "raw": "https://{{SN_TEST_INSTANCE}}.service-now.com/api/sn_cicd/update_set/retrieve?update_set_id={{SYS_ID}}&update_source_id={{SN_DEV_UPDATE_SOURCE_ID}}",
               "protocol": "https",
               "host": ["{{SN_TEST_INSTANCE}}", "service-now", "com"],
-              "path": ["sys_update_set_upload.do"]
+              "path": ["api", "sn_cicd", "update_set", "retrieve"],
+              "query": [
+                { "key": "update_set_id", "value": "{{SYS_ID}}", "description": "sys_id of the local update set on dev" },
+                { "key": "update_source_id", "value": "{{SN_DEV_UPDATE_SOURCE_ID}}", "description": "sys_id of the sys_update_set_source record on test that holds dev credentials" }
+              ]
             },
-            "description": "Uploads the XML file to test via the legacy multipart import processor.\n\n**Script:** `import_set.py` (`client.upload_xml`)\n\n**To use in Postman:** Click the file input in the Body tab and select the XML saved from the export step.\n\n**Expected response:** HTTP 200 (the processor returns 200 even on partial failures — run the Verify Import request next to confirm the record was created)."
+            "description": "Calls the CI/CD Update Set Retrieve API on test. Test reaches out to dev directly using the credentials in the Remote Update Source record and pulls the update set.\n\n**Script:** `transfer.py` (step 1)\n\n**Post-response:** auto-sets `PROGRESS_ID` from `result.links.progress.id`.\n\n**Note:** The request is sent to the TEST instance, not dev. Test does the pulling."
           },
           "response": []
         },
         {
-          "name": "[Test] Verify import — find loaded remote update set",
+          "name": "[Test] Poll retrieval progress",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "    var json = pm.response.json();",
+                  "    var result = json.result || {};",
+                  "    var status      = parseInt(result.status || '0');",
+                  "    var pct         = result.percent_complete || 0;",
+                  "    var statusLabel = result.status_label || '';",
+                  "    console.log('[Poll] ' + pct + '% — ' + statusLabel + '  (status=' + status + ')');",
+                  "    var statusMap = { 0: 'Pending', 1: 'Running', 2: 'Successful', 3: 'Failed', 4: 'Cancelled' };",
+                  "    pm.test('Progress status: ' + (statusMap[status] || status), function () {",
+                  "        pm.expect([0,1,2]).to.include(status);",
+                  "    });",
+                  "    if (status === 2) {",
+                  "        console.log('[Poll] Retrieval complete — proceed to Verify remote update set.');",
+                  "    } else if (status >= 3) {",
+                  "        var detail = result.status_detail || result.error || result.status_message || '';",
+                  "        console.error('[Poll] Retrieval failed: ' + detail);",
+                  "    } else {",
+                  "        console.log('[Poll] Still running. Re-send this request in a few seconds.');",
+                  "    }",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "basic",
+              "basic": [
+                { "key": "username", "value": "{{SN_TEST_USER}}", "type": "string" },
+                { "key": "password", "value": "{{SN_TEST_PASS}}", "type": "string" }
+              ]
+            },
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "https://{{SN_TEST_INSTANCE}}.service-now.com/api/sn_cicd/progress/{{PROGRESS_ID}}",
+              "protocol": "https",
+              "host": ["{{SN_TEST_INSTANCE}}", "service-now", "com"],
+              "path": ["api", "sn_cicd", "progress", "{{PROGRESS_ID}}"]
+            },
+            "description": "Polls the CI/CD progress record for the retrieval operation. Re-send every few seconds until `status` is `2` (Successful).\n\n**Script:** `transfer.py` (step 2, via `sn.py:poll_progress`)\n\n**Status codes:** 0=Pending, 1=Running, 2=Successful, 3=Failed, 4=Cancelled"
+          },
+          "response": []
+        },
+        {
+          "name": "[Test] Verify remote update set",
           "event": [
             {
               "listen": "test",
@@ -416,7 +397,7 @@
                   "            pm.expect(record.state).to.equal('loaded');",
                   "        });",
                   "    } else {",
-                  "        console.error('[Error] No loaded remote update set found for SET_NAME=' + pm.collectionVariables.get('SET_NAME') + '. The upload may have failed silently.');",
+                  "        console.error('[Transfer] No remote update set found for SET_NAME=' + pm.collectionVariables.get('SET_NAME'));",
                   "        pm.test('Remote update set found', function () { pm.expect(json.result.length).to.be.above(0); });",
                   "    }",
                   "}"
@@ -437,26 +418,26 @@
               { "key": "Accept", "value": "application/json" }
             ],
             "url": {
-              "raw": "https://{{SN_TEST_INSTANCE}}.service-now.com/api/now/table/sys_remote_update_set?sysparm_query=name={{SET_NAME}}^state=loaded&sysparm_fields=sys_id,name,state&sysparm_orderbydesc=sys_created_on&sysparm_limit=1",
+              "raw": "https://{{SN_TEST_INSTANCE}}.service-now.com/api/now/table/sys_remote_update_set?sysparm_query=name={{SET_NAME}}&sysparm_fields=sys_id,name,state&sysparm_orderbydesc=sys_created_on&sysparm_limit=1",
               "protocol": "https",
               "host": ["{{SN_TEST_INSTANCE}}", "service-now", "com"],
               "path": ["api", "now", "table", "sys_remote_update_set"],
               "query": [
-                { "key": "sysparm_query", "value": "name={{SET_NAME}}^state=loaded", "description": "Name match AND state=loaded" },
+                { "key": "sysparm_query", "value": "name={{SET_NAME}}", "description": "Exact name match" },
                 { "key": "sysparm_fields", "value": "sys_id,name,state" },
-                { "key": "sysparm_orderbydesc", "value": "sys_created_on", "description": "Most recently created first, in case the set was imported multiple times" },
+                { "key": "sysparm_orderbydesc", "value": "sys_created_on", "description": "Most recent first" },
                 { "key": "sysparm_limit", "value": "1" }
               ]
             },
-            "description": "Confirms the upload created a `sys_remote_update_set` record in `loaded` state.\n\n**Script:** `import_set.py` (post-upload verification)\n\n**Wait:** The import processor is asynchronous — run this request a few seconds after the upload. The pipeline uses `time.sleep(3)` between upload and this check.\n\n**Post-response:** sets `REMOTE_SYS_ID` from the result."
+            "description": "Confirms the retrieval created a `sys_remote_update_set` record in `loaded` state.\n\n**Script:** `transfer.py` (step 3)\n\n**Post-response:** sets `REMOTE_SYS_ID` — needed by all subsequent Preview and Commit requests."
           },
           "response": []
         }
       ]
     },
     {
-      "name": "5 · Preview",
-      "description": "Mirrors trigger_preview.py and poll_preview.py — starts collision detection on test and polls until complete.",
+      "name": "4 · Preview",
+      "description": "Mirrors poll_preview.py — triggers collision-detection preview on test and polls until complete.\n\nIf the set is already in `previewed` state (resume_previewed scenario), skip directly to '5 · Commit'.",
       "item": [
         {
           "name": "[Test] Trigger preview",
@@ -483,7 +464,7 @@
                 { "key": "sysparm_sys_id", "value": "{{REMOTE_SYS_ID}}" }
               ]
             },
-            "description": "Starts the collision-detection preview for the remote update set. The processor runs asynchronously — this call only kicks it off.\n\n**Script:** `trigger_preview.py` (`client.post`)\n\n**Expected response:** HTTP 200 (even if the body is empty or HTML). Use 'Poll preview state' to track progress."
+            "description": "Starts the collision-detection preview for the remote update set. The processor runs asynchronously — this call only kicks it off.\n\n**Script:** `poll_preview.py` (`client.post`)\n\n**Expected response:** HTTP 200. Use 'Poll preview state' to track progress."
           },
           "response": []
         },
@@ -499,11 +480,11 @@
                   "    var json = pm.response.json();",
                   "    var state = json.result && json.result.state;",
                   "    console.log('[Poll] Preview state: ' + state);",
-                  "    pm.test('Preview state', function () {",
+                  "    pm.test('Preview state is valid', function () {",
                   "        pm.expect(['previewed', 'loaded', 'previewing', 'error']).to.include(state);",
                   "    });",
                   "    if (state === 'previewed') {",
-                  "        console.log('[Poll] Preview complete — safe to proceed to Commit.');",
+                  "        console.log('[Poll] Preview complete — proceed to List preview conflicts.');",
                   "    } else if (state === 'error') {",
                   "        console.error('[Poll] Preview ended in error. Open test → Retrieved Update Sets to investigate.');",
                   "    } else {",
@@ -535,7 +516,7 @@
                 { "key": "sysparm_fields", "value": "sys_id,name,state" }
               ]
             },
-            "description": "Checks the current state of the remote update set. Re-send every 10 seconds until `state` is `previewed`.\n\n**Script:** `poll_preview.py` (poll loop iteration)\n\n**State transitions:** `loaded` → `previewing` → `previewed` (or `error`)\n\n**Post-response:** logs state and guidance."
+            "description": "Checks the current state of the remote update set. Re-send every 10 seconds until `state` is `previewed`.\n\n**Script:** `poll_preview.py` (poll loop)\n\n**State transitions:** `loaded` → `previewing` → `previewed` (or `error`)"
           },
           "response": []
         },
@@ -589,18 +570,44 @@
                 { "key": "sysparm_limit", "value": "50" }
               ]
             },
-            "description": "Checks for collision-type preview problems after preview completes. Run this after `state` reaches `previewed`.\n\n**Script:** `poll_preview.py` (post-poll conflict check)\n\n**Expected result:** Empty `result` array. If any conflicts appear, resolve them manually in test (System Update Sets → Retrieved Update Sets) before running the pipeline."
+            "description": "Checks for collision-type preview problems after preview completes.\n\n**Script:** `poll_preview.py` (post-poll conflict check)\n\n**Expected result:** Empty `result` array. If any conflicts appear, resolve them manually in test (go to `sys_remote_update_set_list.do`) before re-running."
           },
           "response": []
         }
       ]
     },
     {
-      "name": "6 · Commit",
-      "description": "Mirrors commit.py — triggers the commit on test and polls until the state reaches 'committed'.",
+      "name": "5 · Commit",
+      "description": "Mirrors commit.py — triggers the commit via the CI/CD API and polls until committed.\n\nRun in order: trigger → poll progress → verify state.",
       "item": [
         {
           "name": "[Test] Trigger commit",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "    var json = pm.response.json();",
+                  "    try {",
+                  "        var progressId  = json.result.links.progress.id;",
+                  "        var progressUrl = json.result.links.progress.url;",
+                  "        pm.collectionVariables.set('PROGRESS_ID', progressId);",
+                  "        console.log('[Auto] PROGRESS_ID → ' + progressId);",
+                  "        console.log('[Commit] Track progress at: ' + progressUrl);",
+                  "        pm.test('Progress ID returned', function () {",
+                  "            pm.expect(progressId).to.be.a('string').and.not.empty;",
+                  "        });",
+                  "    } catch (e) {",
+                  "        console.error('[Commit] Unexpected response shape — check body for error details.');",
+                  "        pm.test('Progress link present in response', function () { pm.expect(false).to.be.true; });",
+                  "    }",
+                  "}"
+                ]
+              }
+            }
+          ],
           "request": {
             "auth": {
               "type": "basic",
@@ -610,27 +617,26 @@
               ]
             },
             "method": "POST",
-            "header": [],
+            "header": [
+              { "key": "Accept", "value": "application/json" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
             "body": {
               "mode": "raw",
-              "raw": ""
+              "raw": "{}"
             },
             "url": {
-              "raw": "https://{{SN_TEST_INSTANCE}}.service-now.com/sys_remote_update_set_commit.do?sysparm_sys_id={{REMOTE_SYS_ID}}&sysparm_ck=",
+              "raw": "https://{{SN_TEST_INSTANCE}}.service-now.com/api/sn_cicd/update_set/commit/{{REMOTE_SYS_ID}}",
               "protocol": "https",
               "host": ["{{SN_TEST_INSTANCE}}", "service-now", "com"],
-              "path": ["sys_remote_update_set_commit.do"],
-              "query": [
-                { "key": "sysparm_sys_id", "value": "{{REMOTE_SYS_ID}}" },
-                { "key": "sysparm_ck", "value": "", "description": "CSRF token — empty string is accepted by the processor" }
-              ]
+              "path": ["api", "sn_cicd", "update_set", "commit", "{{REMOTE_SYS_ID}}"]
             },
-            "description": "Triggers the commit of the previewed update set on test. The processor runs asynchronously.\n\n**Script:** `commit.py` (`client.post`)\n\n**Expected response:** HTTP 200. Use 'Poll commit state' to track progress."
+            "description": "Triggers the commit of the previewed update set via the CI/CD Update Set Commit API. The commit runs asynchronously.\n\n**Script:** `commit.py`\n\n**Post-response:** auto-sets `PROGRESS_ID` from `result.links.progress.id`.\n\n**Note:** This replaces the legacy `sys_remote_update_set_commit.do` endpoint, which requires a CSRF token from a browser session and silently does nothing when called with Basic Auth alone."
           },
           "response": []
         },
         {
-          "name": "[Test] Poll commit state",
+          "name": "[Test] Poll commit progress",
           "event": [
             {
               "listen": "test",
@@ -639,15 +645,20 @@
                 "exec": [
                   "if (pm.response.code === 200) {",
                   "    var json = pm.response.json();",
-                  "    var state = json.result && json.result.state;",
-                  "    console.log('[Poll] Commit state: ' + state);",
-                  "    pm.test('Commit state', function () {",
-                  "        pm.expect(['committed', 'previewed', 'committing', 'error']).to.include(state);",
+                  "    var result = json.result || {};",
+                  "    var status      = parseInt(result.status || '0');",
+                  "    var pct         = result.percent_complete || 0;",
+                  "    var statusLabel = result.status_label || '';",
+                  "    console.log('[Poll] ' + pct + '% — ' + statusLabel + '  (status=' + status + ')');",
+                  "    var statusMap = { 0: 'Pending', 1: 'Running', 2: 'Successful', 3: 'Failed', 4: 'Cancelled' };",
+                  "    pm.test('Progress status: ' + (statusMap[status] || status), function () {",
+                  "        pm.expect([0,1,2]).to.include(status);",
                   "    });",
-                  "    if (state === 'committed') {",
-                  "        console.log('[Poll] Committed successfully. Update set is live on test.');",
-                  "    } else if (state === 'error') {",
-                  "        console.error('[Poll] Commit ended in error. Check test → Retrieved Update Sets.');",
+                  "    if (status === 2) {",
+                  "        console.log('[Poll] Commit complete — proceed to Verify committed state.');",
+                  "    } else if (status >= 3) {",
+                  "        var detail = result.status_detail || result.error || result.status_message || '';",
+                  "        console.error('[Poll] Commit failed: ' + detail);",
                   "    } else {",
                   "        console.log('[Poll] Still running. Re-send this request in a few seconds.');",
                   "    }",
@@ -669,15 +680,62 @@
               { "key": "Accept", "value": "application/json" }
             ],
             "url": {
-              "raw": "https://{{SN_TEST_INSTANCE}}.service-now.com/api/now/table/sys_remote_update_set/{{REMOTE_SYS_ID}}?sysparm_fields=state,name",
+              "raw": "https://{{SN_TEST_INSTANCE}}.service-now.com/api/sn_cicd/progress/{{PROGRESS_ID}}",
+              "protocol": "https",
+              "host": ["{{SN_TEST_INSTANCE}}", "service-now", "com"],
+              "path": ["api", "sn_cicd", "progress", "{{PROGRESS_ID}}"]
+            },
+            "description": "Polls the CI/CD progress record for the commit operation. Re-send every few seconds until `status` is `2` (Successful).\n\n**Script:** `commit.py` (via `sn.py:poll_progress`)\n\n**Status codes:** 0=Pending, 1=Running, 2=Successful, 3=Failed, 4=Cancelled"
+          },
+          "response": []
+        },
+        {
+          "name": "[Test] Verify committed state",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "    var json = pm.response.json();",
+                  "    var state = json.result && json.result.state;",
+                  "    console.log('[Verify] Remote update set state: ' + state);",
+                  "    pm.test('Update set is committed', function () {",
+                  "        pm.expect(state).to.equal('committed');",
+                  "    });",
+                  "    if (state === 'committed') {",
+                  "        console.log('[Verify] Successfully committed. Changes are now live on test.');",
+                  "    } else {",
+                  "        console.warn('[Verify] Unexpected state: ' + state + '. Check test → Retrieved Update Sets.');",
+                  "    }",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "basic",
+              "basic": [
+                { "key": "username", "value": "{{SN_TEST_USER}}", "type": "string" },
+                { "key": "password", "value": "{{SN_TEST_PASS}}", "type": "string" }
+              ]
+            },
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "https://{{SN_TEST_INSTANCE}}.service-now.com/api/now/table/sys_remote_update_set/{{REMOTE_SYS_ID}}?sysparm_fields=sys_id,name,state",
               "protocol": "https",
               "host": ["{{SN_TEST_INSTANCE}}", "service-now", "com"],
               "path": ["api", "now", "table", "sys_remote_update_set", "{{REMOTE_SYS_ID}}"],
               "query": [
-                { "key": "sysparm_fields", "value": "state,name" }
+                { "key": "sysparm_fields", "value": "sys_id,name,state" }
               ]
             },
-            "description": "Polls the commit state. Re-send every 10 seconds until `state` is `committed`.\n\n**Script:** `commit.py` (poll loop iteration)\n\n**State transitions:** `previewed` → `committing` → `committed` (or `error`)"
+            "description": "Confirms the remote update set reached `committed` state.\n\n**Expected:** `result.state === 'committed'`"
           },
           "response": []
         }

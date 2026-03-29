@@ -141,7 +141,7 @@ jobs:
       # and `remote_sys_id` if the set already exists on test.
       # All subsequent steps condition on `action`.
       # -----------------------------------------------------------------------
-      - name: "0/5 — Precheck state on test"
+      - name: "0/4 — Precheck state on test"
         id: precheck
         env:
           SN_INSTANCE: ${{ secrets.SN_TEST_INSTANCE }}
@@ -159,7 +159,7 @@ jobs:
       #        Store the record's sys_id as secret SN_DEV_UPDATE_SOURCE_ID.
       # Skipped when resuming from a partial state (set already exists on test).
       # -----------------------------------------------------------------------
-      - name: "1/5 — Transfer update set to test"
+      - name: "1/4 — Transfer update set to test"
         id: transfer
         if: steps.precheck.outputs.action == 'deploy'
         env:
@@ -172,35 +172,13 @@ jobs:
         run: python3 .github/scripts/transfer.py
 
       # -----------------------------------------------------------------------
-      # Step 2: Trigger Preview
-      # Calls the ServiceNow preview processor to start collision detection.
-      # Preview runs asynchronously — Step 4 polls until it finishes.
-      # Skipped when resuming from previewed state (already past this step).
-      # -----------------------------------------------------------------------
-      - name: "2/5 — Trigger Preview on test"
-        id: preview_trigger
-        if: |
-          steps.precheck.outputs.action == 'deploy' ||
-          steps.precheck.outputs.action == 'resume_loaded'
-        env:
-          SN_INSTANCE: ${{ secrets.SN_TEST_INSTANCE }}
-          SN_USER: ${{ secrets.SN_TEST_USERNAME }}
-          SN_PASS: ${{ secrets.SN_TEST_PASSWORD }}
-          # Use precheck's sys_id when resuming; transfer's sys_id for fresh deploys
-          REMOTE_SYS_ID: ${{ steps.precheck.outputs.remote_sys_id || steps.transfer.outputs.remote_sys_id }}
-        run: python3 .github/scripts/trigger_preview.py
-
-      # -----------------------------------------------------------------------
-      # Step 3: Poll Until Preview Completes
-      # Polls the sys_remote_update_set record every 10 seconds.
-      # On completion, checks sys_update_preview_problem for collisions.
-      # Fails the job if any collision-type problems are found.
-      # For resume_previewed: state is already 'previewed' so the loop exits
-      # immediately on the first poll without sleeping.
+      # Step 2: Preview
+      # Triggers collision-detection preview (skipped if already previewed),
+      # polls until the state reaches 'previewed', then checks for conflicts.
       # Skipped only when the set was already committed (action=skip).
       # -----------------------------------------------------------------------
-      - name: "3/5 — Poll Until Preview Completes"
-        id: preview_poll
+      - name: "2/4 — Preview on test"
+        id: preview
         if: steps.precheck.outputs.action != 'skip'
         env:
           SN_INSTANCE: ${{ secrets.SN_TEST_INSTANCE }}
@@ -211,11 +189,11 @@ jobs:
         run: python3 .github/scripts/poll_preview.py
 
       # -----------------------------------------------------------------------
-      # Step 4: Commit
+      # Step 3: Commit
       # Calls the ServiceNow commit processor, then polls until 'committed'.
       # Skipped only when the set was already committed (action=skip).
       # -----------------------------------------------------------------------
-      - name: "4/5 — Commit on test"
+      - name: "3/4 — Commit on test"
         id: commit
         if: steps.precheck.outputs.action != 'skip'
         env:
@@ -227,10 +205,10 @@ jobs:
         run: python3 .github/scripts/commit.py
 
       # -----------------------------------------------------------------------
-      # Step 5: Skip notice
+      # Step 4: Skip notice
       # Runs only when the set was already committed on test (action=skip).
       # -----------------------------------------------------------------------
-      - name: "5/5 — Already committed (skipped)"
+      - name: "4/4 — Already committed (skipped)"
         if: steps.precheck.outputs.action == 'skip'
         run: |
           echo "::notice::Update set '${{ matrix.update_set.name }}' was already committed on test. No action taken."
