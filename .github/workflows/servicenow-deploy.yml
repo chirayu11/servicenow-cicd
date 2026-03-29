@@ -2,8 +2,8 @@
 # ServiceNow — Promote Dev to Test
 #
 # Automatically discovers all completed Update Sets in dev that have not yet
-# been committed to test, presents the list for human review, then exports,
-# imports, previews, and commits each set in order.
+# been committed to test, presents the list for human review, then transfers,
+# previews, and commits each set in order.
 #
 # Robustness features:
 #   - Fails hard if test is ahead of dev (committed sets on test with no match
@@ -13,7 +13,7 @@
 #       committed   → skip (idempotent)
 #       previewed   → resume from commit step
 #       loaded      → resume from preview step
-#       not found   → full export → import → preview → commit
+#       not found   → full transfer → preview → commit
 #   - Commit step polls until complete rather than sleeping a fixed interval,
 #     so large update sets don't fail due to async processing timing.
 #
@@ -141,7 +141,7 @@ jobs:
       # and `remote_sys_id` if the set already exists on test.
       # All subsequent steps condition on `action`.
       # -----------------------------------------------------------------------
-      - name: "0/6 — Precheck state on test"
+      - name: "0/5 — Precheck state on test"
         id: precheck
         env:
           SN_INSTANCE: ${{ secrets.SN_TEST_INSTANCE }}
@@ -151,55 +151,33 @@ jobs:
         run: python3 .github/scripts/precheck.py
 
       # -----------------------------------------------------------------------
-      # Step 1: Export
-      # Downloads the update set as XML from dev.
-      # Validates the response is real XML (ServiceNow sometimes returns an HTML
-      # error page with HTTP 200 when the session is invalid or dev is sleeping).
+      # Step 1: Transfer
+      # Reads change records from dev via the Table API and creates the
+      # corresponding sys_remote_update_set + sys_update_xml records on test.
+      # No XML file is generated; no legacy .do endpoint is used.
       # Skipped when resuming from a partial state (set already exists on test).
       # -----------------------------------------------------------------------
-      - name: "1/6 — Export XML from dev"
-        id: export
+      - name: "1/5 — Transfer update set to test"
+        id: transfer
         if: steps.precheck.outputs.action == 'deploy'
         env:
-          SN_INSTANCE: ${{ secrets.SN_DEV_INSTANCE }}
-          SN_USER: ${{ secrets.SN_DEV_USERNAME }}
-          SN_PASS: ${{ secrets.SN_DEV_PASSWORD }}
+          SN_DEV_INSTANCE: ${{ secrets.SN_DEV_INSTANCE }}
+          SN_DEV_USER: ${{ secrets.SN_DEV_USERNAME }}
+          SN_DEV_PASS: ${{ secrets.SN_DEV_PASSWORD }}
+          SN_TEST_INSTANCE: ${{ secrets.SN_TEST_INSTANCE }}
+          SN_TEST_USER: ${{ secrets.SN_TEST_USERNAME }}
+          SN_TEST_PASS: ${{ secrets.SN_TEST_PASSWORD }}
           SYS_ID: ${{ matrix.update_set.sys_id }}
           SET_NAME: ${{ matrix.update_set.name }}
-        run: python3 .github/scripts/export.py
-
-      - name: "Upload export XML artifact (debug)"
-        if: steps.precheck.outputs.action == 'deploy'
-        uses: actions/upload-artifact@v4
-        with:
-          name: update-set-xml-${{ matrix.update_set.sys_id }}
-          path: ${{ steps.export.outputs.export_file }}
-          retention-days: 3
+        run: python3 .github/scripts/transfer.py
 
       # -----------------------------------------------------------------------
-      # Step 2: Import
-      # Uploads the XML to test via the update set upload form endpoint.
-      # Then locates the created sys_remote_update_set record by name.
-      # Skipped when resuming (set already exists on test in loaded/previewed state).
-      # -----------------------------------------------------------------------
-      - name: "2/6 — Import XML to test"
-        id: import_set
-        if: steps.precheck.outputs.action == 'deploy'
-        env:
-          SN_INSTANCE: ${{ secrets.SN_TEST_INSTANCE }}
-          SN_USER: ${{ secrets.SN_TEST_USERNAME }}
-          SN_PASS: ${{ secrets.SN_TEST_PASSWORD }}
-          EXPORT_FILE: ${{ steps.export.outputs.export_file }}
-          SET_NAME: ${{ matrix.update_set.name }}
-        run: python3 .github/scripts/import_set.py
-
-      # -----------------------------------------------------------------------
-      # Step 3: Trigger Preview
+      # Step 2: Trigger Preview
       # Calls the ServiceNow preview processor to start collision detection.
       # Preview runs asynchronously — Step 4 polls until it finishes.
       # Skipped when resuming from previewed state (already past this step).
       # -----------------------------------------------------------------------
-      - name: "3/6 — Trigger Preview on test"
+      - name: "2/5 — Trigger Preview on test"
         id: preview_trigger
         if: |
           steps.precheck.outputs.action == 'deploy' ||
@@ -208,12 +186,12 @@ jobs:
           SN_INSTANCE: ${{ secrets.SN_TEST_INSTANCE }}
           SN_USER: ${{ secrets.SN_TEST_USERNAME }}
           SN_PASS: ${{ secrets.SN_TEST_PASSWORD }}
-          # Use precheck's sys_id when resuming; import_set's sys_id for fresh deploys
-          REMOTE_SYS_ID: ${{ steps.precheck.outputs.remote_sys_id || steps.import_set.outputs.remote_sys_id }}
+          # Use precheck's sys_id when resuming; transfer's sys_id for fresh deploys
+          REMOTE_SYS_ID: ${{ steps.precheck.outputs.remote_sys_id || steps.transfer.outputs.remote_sys_id }}
         run: python3 .github/scripts/trigger_preview.py
 
       # -----------------------------------------------------------------------
-      # Step 4: Poll Until Preview Completes
+      # Step 3: Poll Until Preview Completes
       # Polls the sys_remote_update_set record every 10 seconds.
       # On completion, checks sys_update_preview_problem for collisions.
       # Fails the job if any collision-type problems are found.
@@ -221,38 +199,38 @@ jobs:
       # immediately on the first poll without sleeping.
       # Skipped only when the set was already committed (action=skip).
       # -----------------------------------------------------------------------
-      - name: "4/6 — Poll Until Preview Completes"
+      - name: "3/5 — Poll Until Preview Completes"
         id: preview_poll
         if: steps.precheck.outputs.action != 'skip'
         env:
           SN_INSTANCE: ${{ secrets.SN_TEST_INSTANCE }}
           SN_USER: ${{ secrets.SN_TEST_USERNAME }}
           SN_PASS: ${{ secrets.SN_TEST_PASSWORD }}
-          REMOTE_SYS_ID: ${{ steps.precheck.outputs.remote_sys_id || steps.import_set.outputs.remote_sys_id }}
+          REMOTE_SYS_ID: ${{ steps.precheck.outputs.remote_sys_id || steps.transfer.outputs.remote_sys_id }}
           SET_NAME: ${{ matrix.update_set.name }}
         run: python3 .github/scripts/poll_preview.py
 
       # -----------------------------------------------------------------------
-      # Step 5: Commit
+      # Step 4: Commit
       # Calls the ServiceNow commit processor, then polls until 'committed'.
       # Skipped only when the set was already committed (action=skip).
       # -----------------------------------------------------------------------
-      - name: "5/6 — Commit on test"
+      - name: "4/5 — Commit on test"
         id: commit
         if: steps.precheck.outputs.action != 'skip'
         env:
           SN_INSTANCE: ${{ secrets.SN_TEST_INSTANCE }}
           SN_USER: ${{ secrets.SN_TEST_USERNAME }}
           SN_PASS: ${{ secrets.SN_TEST_PASSWORD }}
-          REMOTE_SYS_ID: ${{ steps.precheck.outputs.remote_sys_id || steps.import_set.outputs.remote_sys_id }}
+          REMOTE_SYS_ID: ${{ steps.precheck.outputs.remote_sys_id || steps.transfer.outputs.remote_sys_id }}
           SET_NAME: ${{ matrix.update_set.name }}
         run: python3 .github/scripts/commit.py
 
       # -----------------------------------------------------------------------
-      # Step 6: Skip notice
+      # Step 5: Skip notice
       # Runs only when the set was already committed on test (action=skip).
       # -----------------------------------------------------------------------
-      - name: "6/6 — Already committed (skipped)"
+      - name: "5/5 — Already committed (skipped)"
         if: steps.precheck.outputs.action == 'skip'
         run: |
           echo "::notice::Update set '${{ matrix.update_set.name }}' was already committed on test. No action taken."

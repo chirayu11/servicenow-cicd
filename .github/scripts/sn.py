@@ -8,24 +8,17 @@ own directory to sys.path when run directly, importing is simply:
     from sn import ServiceNowClient, gha_output, gha_output_multiline, gha_summary
 """
 import os
-import re
 import sys
 
 import requests
 
 
 class ServiceNowClient:
-    """HTTP client for the ServiceNow REST API and legacy .do endpoints.
-
-    Uses requests.Session so that cookies established by the first Table API
-    call (which accepts Basic Auth) are automatically reused by subsequent
-    legacy .do processor calls (which require a server-side session cookie).
-    """
+    """HTTP client for the ServiceNow Table API and legacy .do endpoints."""
 
     def __init__(self, instance: str, user: str, password: str):
         self.instance = instance
         self.base_url = f'https://{instance}.service-now.com'
-        self._user = user
         self._session = requests.Session()
         self._session.auth = (user, password)
 
@@ -52,14 +45,19 @@ class ServiceNowClient:
             sys.exit(1)
         return resp.json()
 
-    def get_raw(self, path: str, accept: str = 'application/xml') -> bytes:
-        """GET a path and return the raw response body. Exits on HTTP error."""
+    def post_json(self, path: str, body: dict) -> dict:
+        """POST JSON to a Table API path and return parsed JSON. Exits on HTTP error."""
         url = self.base_url + path
-        resp = self._session.get(url, headers={'Accept': accept}, timeout=120)
+        resp = self._session.post(
+            url,
+            json=body,
+            headers={'Accept': 'application/json'},
+            timeout=60,
+        )
         if not resp.ok:
-            print(f'::error::GET {url} returned HTTP {resp.status_code}.')
+            print(f'::error::POST {url} returned HTTP {resp.status_code}: {resp.text[:300]}')
             sys.exit(1)
-        return resp.content
+        return resp.json()
 
     def post(self, path: str) -> None:
         """
@@ -69,37 +67,6 @@ class ServiceNowClient:
         url = self.base_url + path
         resp = self._session.post(url, data=b'', timeout=120)
         resp.raise_for_status()
-
-    def upload_xml(self, path: str, file_path: str) -> requests.Response:
-        """
-        POST a multipart/form-data XML file upload to a legacy .do processor.
-
-        ServiceNow Jelly processors require a CSRF token (sysparm_ck / g_ck).
-        Without it the processor re-renders the form page with HTTP 200 and
-        creates nothing. We GET the page first to extract the token, then POST.
-
-        Returns the full Response so callers can inspect status_code, url, and text.
-        """
-        url = self.base_url + path
-
-        # Extract the CSRF token from the upload form page.
-        page = self._session.get(url, timeout=60)
-        m = re.search(r"var g_ck\s*=\s*['\"]([a-f0-9]+)['\"]", page.text)
-        if m:
-            sysparm_ck = m.group(1)
-            print(f'Extracted sysparm_ck: {sysparm_ck[:8]}…')
-        else:
-            sysparm_ck = ''
-            print('::warning::Could not extract sysparm_ck from upload page — proceeding without CSRF token.')
-
-        with open(file_path, 'rb') as f:
-            return self._session.post(
-                url,
-                data={'sysparm_ck': sysparm_ck},
-                files={'attachmentFile': ('update_set.xml', f, 'application/xml')},
-                allow_redirects=True,
-                timeout=120,
-            )
 
 
 # ---------------------------------------------------------------------------
