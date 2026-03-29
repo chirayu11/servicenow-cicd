@@ -1,23 +1,17 @@
 #!/usr/bin/env python3
 """
-commit.py — commit the previewed update set on test, then poll until done.
-
-Replaces the original sleep 5 + single-check pattern with a polling loop
-identical to poll_preview.py, so large update sets don't fail due to timing.
+commit.py — commit the previewed update set on test via the CI/CD API.
 
 Required env vars:
   SN_INSTANCE    — test instance subdomain
   SN_USER        — test admin username
   SN_PASS        — test admin password
   REMOTE_SYS_ID  — sys_id of the sys_remote_update_set record on test
-                   (resolved by the workflow as: precheck.remote_sys_id || import_set.remote_sys_id)
-  SET_NAME       — update set name (for log messages and step summary)
+  SET_NAME       — update set name (for log messages)
 """
 import os
 import sys
 import time
-
-import requests
 
 from sn import ServiceNowClient, gha_summary
 
@@ -30,56 +24,47 @@ INTERVAL = 10
 client = ServiceNowClient.from_env()
 
 # ---------------------------------------------------------------------------
-# Trigger the commit
-# The commit processor is a legacy .do endpoint — the same one the
-# ServiceNow UI calls when you click the "Commit" button.
+# Trigger commit via the CI/CD Update Set API
 # ---------------------------------------------------------------------------
+print(f"Triggering commit for '{SET_NAME}' ({REMOTE_SYS_ID})...")
+result = client.post_json(f'/api/sn_cicd/update_set/commit/{REMOTE_SYS_ID}', {})
+
 try:
-    client.post(
-        f'/sys_remote_update_set_commit.do?sysparm_sys_id={REMOTE_SYS_ID}&sysparm_ck='
-    )
-except requests.exceptions.HTTPError as e:
-    print(
-        f'::warning::Commit trigger returned HTTP {e.response.status_code}. '
-        'Polling to check whether the commit proceeded...'
-    )
+    progress_id  = result['result']['links']['progress']['id']
+    progress_url = result['result']['links']['progress']['url']
+except (KeyError, TypeError):
+    print(f'::error::Unexpected commit response: {result}')
+    sys.exit(1)
 
-print(f"Commit triggered for '{SET_NAME}' ({REMOTE_SYS_ID}). Polling for completion...")
+print(f'Commit triggered. Progress: {progress_url}')
 
 # ---------------------------------------------------------------------------
-# Poll until state = 'committed'
-# Commit is asynchronous on large update sets — the .do endpoint returns
-# before the background processor finishes writing all changes.
+# Poll progress until committed
+# Status: 0=Pending, 1=Running, 2=Successful, 3=Failed, 4=Cancelled
 # ---------------------------------------------------------------------------
 elapsed = 0
 
 while True:
-    data  = client.get_json(
-        f'/api/now/table/sys_remote_update_set/{REMOTE_SYS_ID}'
-        f'?sysparm_fields=state,name'
-    )
-    state = data['result']['state']
-    print(f'[{elapsed}s] Commit state: {state}')
+    prog   = client.get_json(f'/api/sn_cicd/progress/{progress_id}').get('result', {})
+    status = int(prog.get('status', 0))
+    pct    = prog.get('percent_complete', 0)
+    label  = prog.get('status_label', '')
+    print(f'[{elapsed}s] {pct}% — {label}')
 
-    if state == 'committed':
+    if status == 2:
         print(f"::notice::Successfully committed '{SET_NAME}' to test.")
         gha_summary(
             f'### Committed: `{SET_NAME}`\n'
             f'- Remote sys_id on test: `{REMOTE_SYS_ID}`\n'
         )
         sys.exit(0)
-    elif state == 'error':
-        print(
-            f"::error::Commit ended in error state for '{SET_NAME}'. "
-            "Check test → Retrieved Update Sets for details."
-        )
+    if status >= 3:
+        detail = prog.get('status_detail') or prog.get('error') or prog.get('status_message', '')
+        print(f"::error::Commit failed ({label}): {detail}")
         sys.exit(1)
 
     if elapsed >= TIMEOUT:
-        print(
-            f"::error::Commit timed out after {TIMEOUT}s. Last state: '{state}'. "
-            "Check test → Retrieved Update Sets manually."
-        )
+        print(f"::error::Commit timed out after {TIMEOUT}s.")
         sys.exit(1)
 
     time.sleep(INTERVAL)
