@@ -18,7 +18,7 @@ from sn import ServiceNowClient, gha_summary
 REMOTE_SYS_ID = os.environ['REMOTE_SYS_ID']
 SET_NAME      = os.environ['SET_NAME']
 
-TIMEOUT  = 300
+TIMEOUT  = 60
 INTERVAL = 10
 
 client = ServiceNowClient.from_env()
