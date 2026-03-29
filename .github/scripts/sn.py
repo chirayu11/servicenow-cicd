@@ -14,7 +14,7 @@ import requests
 
 
 class ServiceNowClient:
-    """HTTP client for the ServiceNow Table API and legacy .do endpoints."""
+    """HTTP client for ServiceNow REST APIs. Initialized with instance URL and basic auth credentials."""
 
     def __init__(self, instance: str, user: str, password: str):
         self.instance = instance
